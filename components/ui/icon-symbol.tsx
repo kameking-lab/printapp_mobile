@@ -19,6 +19,9 @@ const MAPPING = {
   'book.fill': 'menu-book',
   'chevron.left.forwardslash.chevron.right': 'code',
   'chevron.right': 'chevron-right',
+  calendar: 'event',
+  'fork.knife': 'restaurant',
+  'checkmark.circle': 'check-circle',
 } as IconMapping;
 
 /**

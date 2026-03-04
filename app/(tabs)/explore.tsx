@@ -1,112 +1,173 @@
-import { Image } from 'expo-image';
-import { Platform, StyleSheet } from 'react-native';
+/**
+ * 設定画面 - プレミアム（広告非表示・月額200円）購入・復元
+ */
 
-import { Collapsible } from '@/components/ui/collapsible';
-import { ExternalLink } from '@/components/external-link';
-import ParallaxScrollView from '@/components/parallax-scroll-view';
+import { useCallback, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  ScrollView,
+  StyleSheet,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { IconSymbol } from '@/components/ui/icon-symbol';
-import { Fonts } from '@/constants/theme';
+import { isExpoGo } from '@/lib/env';
+import { usePremium } from '@/lib/premium-context';
 
-export default function TabTwoScreen() {
+export default function SettingsScreen() {
+  const { isPremium, isLoading, refresh } = usePremium();
+  const [purchasing, setPurchasing] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+
+  const handlePurchase = useCallback(async () => {
+    if (isPremium) return;
+    if (isExpoGo()) {
+      Alert.alert('開発用', 'Expo Go では課金は利用できません。開発ビルドでお試しください。');
+      return;
+    }
+    setPurchasing(true);
+    try {
+      const Purchases = (await import('react-native-purchases')).default;
+      const offerings = await Purchases.getOfferings();
+      const defaultOffering = offerings.current;
+      if (!defaultOffering) {
+        Alert.alert('エラー', '現在のオファリングが設定されていません。');
+        return;
+      }
+      const monthly =
+        defaultOffering.monthly ??
+        defaultOffering.availablePackages?.find(
+          (p: { identifier: string }) =>
+            p.identifier === '$rc_monthly' || p.identifier === 'Monthly'
+        ) ??
+        null;
+      if (!monthly) {
+        Alert.alert('エラー', '月額プランが見つかりませんでした。');
+        return;
+      }
+      await Purchases.purchasePackage(monthly);
+      await refresh();
+      Alert.alert('ありがとうございます', 'プレミアム会員になりました。広告は表示されません。');
+    } catch (e: unknown) {
+      const err = e as { userCancelled?: boolean; message?: string; code?: string | number };
+      if (err?.userCancelled) return;
+      const detail =
+        [err?.message, err?.code != null ? `コード: ${err.code}` : '']
+          .filter(Boolean)
+          .join('\n') || '不明なエラーです。';
+      Alert.alert(
+        '購入に失敗しました',
+        `しばらくしてからお試しください。\n\n【詳細（原因究明用）】\n${detail}`
+      );
+    } finally {
+      setPurchasing(false);
+    }
+  }, [isPremium, refresh]);
+
+  const handleRestore = useCallback(async () => {
+    if (isExpoGo()) {
+      Alert.alert('開発用', 'Expo Go では復元は利用できません。開発ビルドでお試しください。');
+      return;
+    }
+    setRestoring(true);
+    try {
+      const Purchases = (await import('react-native-purchases')).default;
+      await Purchases.restorePurchases();
+      await refresh();
+      Alert.alert('復元完了', '購入を復元しました。');
+    } catch {
+      Alert.alert('エラー', '復元に失敗しました。');
+    } finally {
+      setRestoring(false);
+    }
+  }, [refresh]);
+
   return (
-    <ParallaxScrollView
-      headerBackgroundColor={{ light: '#D0D0D0', dark: '#353636' }}
-      headerImage={
-        <IconSymbol
-          size={310}
-          color="#808080"
-          name="chevron.left.forwardslash.chevron.right"
-          style={styles.headerImage}
-        />
-      }>
-      <ThemedView style={styles.titleContainer}>
-        <ThemedText
-          type="title"
-          style={{
-            fontFamily: Fonts.rounded,
-          }}>
-          Explore
+    <SafeAreaView style={styles.safeArea} edges={['top']}>
+      <ThemedView style={styles.container}>
+        <ThemedText type="title" style={styles.title}>
+          設定
         </ThemedText>
-      </ThemedView>
-      <ThemedText>This app includes example code to help you get started.</ThemedText>
-      <Collapsible title="File-based routing">
-        <ThemedText>
-          This app has two screens:{' '}
-          <ThemedText type="defaultSemiBold">app/(tabs)/index.tsx</ThemedText> and{' '}
-          <ThemedText type="defaultSemiBold">app/(tabs)/explore.tsx</ThemedText>
-        </ThemedText>
-        <ThemedText>
-          The layout file in <ThemedText type="defaultSemiBold">app/(tabs)/_layout.tsx</ThemedText>{' '}
-          sets up the tab navigator.
-        </ThemedText>
-        <ExternalLink href="https://docs.expo.dev/router/introduction">
-          <ThemedText type="link">Learn more</ThemedText>
-        </ExternalLink>
-      </Collapsible>
-      <Collapsible title="Android, iOS, and web support">
-        <ThemedText>
-          You can open this project on Android, iOS, and the web. To open the web version, press{' '}
-          <ThemedText type="defaultSemiBold">w</ThemedText> in the terminal running this project.
-        </ThemedText>
-      </Collapsible>
-      <Collapsible title="Images">
-        <ThemedText>
-          For static images, you can use the <ThemedText type="defaultSemiBold">@2x</ThemedText> and{' '}
-          <ThemedText type="defaultSemiBold">@3x</ThemedText> suffixes to provide files for
-          different screen densities
-        </ThemedText>
-        <Image
-          source={require('@/assets/images/react-logo.png')}
-          style={{ width: 100, height: 100, alignSelf: 'center' }}
-        />
-        <ExternalLink href="https://reactnative.dev/docs/images">
-          <ThemedText type="link">Learn more</ThemedText>
-        </ExternalLink>
-      </Collapsible>
-      <Collapsible title="Light and dark mode components">
-        <ThemedText>
-          This template has light and dark mode support. The{' '}
-          <ThemedText type="defaultSemiBold">useColorScheme()</ThemedText> hook lets you inspect
-          what the user&apos;s current color scheme is, and so you can adjust UI colors accordingly.
-        </ThemedText>
-        <ExternalLink href="https://docs.expo.dev/develop/user-interface/color-themes/">
-          <ThemedText type="link">Learn more</ThemedText>
-        </ExternalLink>
-      </Collapsible>
-      <Collapsible title="Animations">
-        <ThemedText>
-          This template includes an example of an animated component. The{' '}
-          <ThemedText type="defaultSemiBold">components/HelloWave.tsx</ThemedText> component uses
-          the powerful{' '}
-          <ThemedText type="defaultSemiBold" style={{ fontFamily: Fonts.mono }}>
-            react-native-reanimated
-          </ThemedText>{' '}
-          library to create a waving hand animation.
-        </ThemedText>
-        {Platform.select({
-          ios: (
-            <ThemedText>
-              The <ThemedText type="defaultSemiBold">components/ParallaxScrollView.tsx</ThemedText>{' '}
-              component provides a parallax effect for the header image.
+        <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
+          <View style={styles.section}>
+            <ThemedText type="subtitle" style={styles.sectionTitle}>
+              広告を非表示にする（月額200円）
             </ThemedText>
-          ),
-        })}
-      </Collapsible>
-    </ParallaxScrollView>
+            <ThemedText style={styles.note}>
+              自動更新される月額課金です。解約しない限り毎月更新されます。
+            </ThemedText>
+            {isLoading ? (
+              <ActivityIndicator size="small" color="#7cb342" style={styles.loader} />
+            ) : isPremium ? (
+              <View style={styles.premiumBadge}>
+                <ThemedText style={styles.premiumText}>プレミアム会員です（月額購読中）</ThemedText>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={styles.primaryButton}
+                onPress={handlePurchase}
+                disabled={purchasing}
+                activeOpacity={0.8}
+              >
+                {purchasing ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <ThemedText style={styles.primaryButtonText}>月額200円で広告を非表示</ThemedText>
+                )}
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={handleRestore}
+              disabled={restoring || isPremium}
+              activeOpacity={0.8}
+            >
+              {restoring ? (
+                <ActivityIndicator color="#7cb342" size="small" />
+              ) : (
+                <ThemedText style={styles.secondaryButtonText}>購入を復元する</ThemedText>
+              )}
+            </TouchableOpacity>
+          </View>
+        </ScrollView>
+      </ThemedView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  headerImage: {
-    color: '#808080',
-    bottom: -90,
-    left: -35,
-    position: 'absolute',
+  safeArea: { flex: 1, backgroundColor: '#faf8f5' },
+  container: { flex: 1, backgroundColor: '#faf8f5' },
+  title: { marginBottom: 16, paddingHorizontal: 20, color: '#2d5016' },
+  scroll: { flex: 1 },
+  scrollContent: { padding: 20, paddingBottom: 40 },
+  section: { marginBottom: 24 },
+  sectionTitle: { marginBottom: 8, color: '#2d5016' },
+  note: { fontSize: 12, color: '#6b6b6b', marginBottom: 12, lineHeight: 18 },
+  loader: { marginVertical: 12 },
+  premiumBadge: {
+    backgroundColor: 'rgba(124, 179, 66, 0.15)',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    marginBottom: 8,
   },
-  titleContainer: {
-    flexDirection: 'row',
-    gap: 8,
+  premiumText: { color: '#2d5016', fontWeight: '600' },
+  primaryButton: {
+    backgroundColor: '#7cb342',
+    paddingVertical: 14,
+    borderRadius: 14,
+    alignItems: 'center',
+    marginBottom: 10,
   },
+  primaryButtonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  secondaryButton: {
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  secondaryButtonText: { color: '#7cb342', fontSize: 15 },
 });

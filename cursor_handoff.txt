@@ -1,0 +1,150 @@
+# プリント管理アプリ - 引き継ぎメモ（テスト解析・白抜き・フラッシュカード）
+
+---
+
+## 0. RedactionEditor 現状サマリ（次のチャット用・必読）
+
+### ✅ 成功している機能（絶対に壊してはいけない仕様）
+
+- **枠の初期配置**: 白抜き枠が適切な大きさ（約20%タイト、REDACTION_TIGHTEN_FACTOR = 0.8 およびプロンプト指示）で初期配置される。
+- **2本指操作**: 画像のズーム・移動が完璧に動作する。`Gesture.Pinch()` と `Gesture.Pan().minPointers(2)` の Simultaneous、親 Animated.View への transform 適用、ローカル座標（event.x / event.y）による一貫した座標系。
+- **長押し削除**: 枠を長押しすると削除確認アラートが表示され、削除が正常に動作する。`Gesture.LongPress().minDuration(400)`（※ LongPress に `.maxPointers` は存在しないため使わない）。
+- **ジェスチャー基盤**: `app/_layout.tsx` でルートを `GestureHandlerRootView` でラップ済み。1本指 Pan は `.minDistance(10)` で誤爆防止（Pan に `.minDuration` は存在しないため使わない）。
+
+### ❌ 次に解決すべき課題（1本指の移動・リサイズが効かないバグ）
+
+- **現象**: 1本指で「既存枠の操作（移動・リサイズ）」が反応しない。
+  - 枠の**中央**を触ってドラッグしても**移動**できない。
+  - 選択状態の枠の**四隅の丸ハンドル**を触ってドラッグしても**リサイズ**が反応しない。
+- **推定原因**: 1本指 Pan の **`onStart` 時のヒットテスト（座標判定）** に問題がある可能性が高い。
+  - `handleOneFingerStart(e.x, e.y)` が呼ばれたあと、`localToPercent(x, y, layoutWidth, layoutHeight)` で 0〜100% に変換し、`hitTestCorner` / `isInsideBox` / `isInBoxCenter` で判定している。
+  - 考えられる要因の例: (1) **onStart が発火するタイミング**が `.minDistance(10)` のため「指が 10px 動いたあと」であり、その時点の (e.x, e.y) が「タッチ開始点」ではなく「10px 動いた後の点」になっている可能性。(2) **layoutRef.current** が onStart 時点で null またはズーム/パン適用後のコンテナと一致していない可能性。(3) ジェスチャーから渡される **event.x / event.y** の座標系が、onLayout で得た width/height と異なるスケールやオフセットになっている可能性。
+- **修正の方向性**: ヒットテストに使う座標を「 Pan の onStart で渡される (x, y) が、コンテナのどのピクセル位置を指しているか」と「layoutRef の width/height」が一致するように検証・修正する。必要なら onStart ではなく `.onBegin` や最初の `.onUpdate` でヒットテストする、または minDistance を 0 に temporarily して開始座標を記録するなどの手を検討する。**2本指ズーム・長押し削除・枠の初期サイズは変更せず、1本指の「既存枠に触れたときの移動・リサイズ」のみを修正すること。**
+
+---
+
+## 1. 未解答（白紙）テストへの対応と choices エラー回避
+
+### ファイル
+- `lib/analyze-print.ts`
+
+### redaction_boxes の空配列許可
+- プロンプトに「解答が一切書かれていない（未解答・白紙の新しいテスト）の場合は redaction_boxes を空配列 [] で返すこと。隠すべきヒントや部分的な印字解答がある箇所のみ枠を生成してもよい」と指示済み。
+- パース側は `parseRedactionBoxes` で空配列をそのまま返す。
+
+### choices が 3〜4 件必須で落ちる問題の根本解決（未解答テストのフォールバック）
+- **プロンプト**: 「プリントに不正解の選択肢が書かれていない場合（未解答・白紙・記述式）でも、AI 自身が文脈から『もっともらしい不正解の選択肢（ダミー）』を自動生成し、必ず 3〜4 つの choices を埋めること」と指示。
+- **アプリ側の堅牢化**: `parseProblemItem` 内で `ensureChoices(choices, correctAnswer)` を呼ぶ。選択肢が 0〜2 件でも、正答を必ず含めつつ「（選択肢2）」「（選択肢3）」などのプレースホルダで 3 件以上に補い、4 件を超えたら先頭 4 件に切り詰める。これにより未解答・記述式でもパースエラーで落ちない。
+
+---
+
+## 2. フラッシュカードの切り抜き元画像（答えの写り込み防止）— スナップショット生成フロー
+
+### 目的
+確定した redaction_boxes（白塗り）を適用した「1枚の画像」を生成し、その画像に対してのみ切り抜き（crop）をかけてフラッシュカード用画像とする。元画像を直接クロップすると解答が写り込む。
+
+### アーキテクチャ（スナップショット → クロップ）
+- **実装**: `app/(tabs)/index.tsx`
+  - テスト結果表示中、**オフスクリーン**のキャプチャ用 View（`flattenCaptureRef`）を 1 つ用意。同じ imageUri と redaction_boxes で、Image + 白い矩形オーバーレイを `imageWidth` x `imageHeight` のサイズでレンダリング（`styles.flattenCaptureView` で `left: -10000` に配置、`collapsable={false}`）。
+  - `react-native-view-shot` の `captureRef(flattenCaptureRef.current, { format: 'jpg', result: 'tmpfile', quality: 0.92, width, height })` で、白塗りが適用された状態の画像 URI を取得。
+  - `saveAsFlashcards` 内で、redaction_boxes が 1 件以上ある場合は**先に**上記キャプチャを行い、得た URI を `sourceUri` とする。その後、各問題の `imageRegion` に対する `cropImageByRegion(sourceUri, w, h, prob.imageRegion)` は**すべてこの白塗り済み画像**に対して実行。redaction_boxes が空の場合は元の imageUri をそのまま crop に使う。
+
+---
+
+## 3. 白抜き枠のサイズ最適化（約 20% タイト）
+
+- **プロンプト**: 「枠を出す場合は、現在より 20% 程度小さく・文字のインク部分だけを極限までタイトに囲むこと」と指示。
+- **フロント**: `lib/analyze-print.ts` の `parseRedactionBox` で **REDACTION_TIGHTEN_FACTOR = 0.8** を適用（中心維持で幅・高さを 0.8 倍）。
+
+---
+
+## 4. 白抜き編集モーダル（RedactionEditor）— ジェスチャー完全リプレイスとローカル座標アーキテクチャ
+
+### ファイル
+- `components/redaction-editor.tsx`
+
+### アーキテクチャの要点
+- **手動の pageX/pageY 計算は廃止**。react-native-gesture-handler (v2) と Reanimated のみで制御。
+- **画像と白抜き枠を同じ 1 つの Animated.View コンテナに入れる**。ズーム/パンの Transform はこの親コンテナに適用する。
+- **枠の描画・編集のタッチ座標は、必ず親が変形しても狂わない event.x / event.y（コンテナ内のローカル座標）を使用**。`localToPercent(x, y, layoutWidth, layoutHeight)` で 0〜100% に変換。ズーム時も座標がずれない。
+- コンテナのレイアウトは **onLayout で width / height のみ取得**（LayoutSize）。measureInWindow は使わない。Animated.View に `width: '100%'` と `aspectRatio` を指定し、onLayout で得たサイズとジェスチャー座標の基準を一致させている。
+
+### シームレスなジェスチャー操作（指の数で自動分岐・モード切替ボタンなし）
+- **2 本指**: 画面の移動・拡大縮小のみ。
+  - `Gesture.Pinch()` と `Gesture.Pan().minPointers(2)` を `Gesture.Simultaneous()` で組み合わせ（`twoFingerGesture`）。
+  - 2 本指で触れている間は枠の描画・選択は一切反応させない。
+- **1 本指**: 枠の作成・移動・リサイズ。
+  - `Gesture.Pan().minPointers(1).maxPointers(1).minDistance(ONE_FINGER_PAN_MIN_DISTANCE)` を使用。※ **Pan には `.minDuration` は存在しない**ため、誤爆防止は `.minDistance(10)`（約 10px 動いてから発火）で行っている。
+  - 何もない場所をなぞる → 新規枠作成。既存枠の中央をなぞる → 移動。四隅のハンドル付近をなぞる → リサイズ。（※ 現時点で「移動・リサイズ」が効かないバグあり。onStart 時のヒットテスト要修正。セクション 0 参照。）
+  - 新規枠として確定するには **MIN_DRAW_DISTANCE_PERCENT（2%）** 以上の移動が必要。ごく小さな枠の誤作成を防ぐ。
+- **長押し削除**: `Gesture.LongPress().minDuration(400)`。※ RNGH の LongPress には `maxPointers` が存在しないため使用しない。発火時に枠上なら削除確認アラートを表示。
+- **ジェスチャー競合の解決**: `Gesture.Exclusive(twoFingerGesture, Exclusive(longPressGesture, oneFingerPanGesture))` で、2 本指 vs 1 本指ブロックを排他。1 本指ブロック内で LongPress と Pan を排他にし、先に成立したほうだけが動く。
+
+### 四隅の丸ハンドル
+- 選択状態の枠の四隅に、直径 **HANDLE_DISPLAY_SIZE = 16** の丸いハンドル（Pastel.coral + 白枠）を描画。
+- **丸ハンドル付近を 1 本指でドラッグした時のみ**リサイズが走るよう、`hitTestCorner` で **HANDLE_HIT_SIZE_PERCENT = 10** と角まわりのマージンでヒット判定。
+
+### 既存枠の操作まとめ
+| 操作     | 方法                                   |
+|----------|----------------------------------------|
+| 選択     | 枠をタップ                             |
+| 移動     | 選択状態で枠の中央をドラッグ           |
+| リサイズ | 選択状態で四隅の丸ハンドルをドラッグ   |
+| 削除     | 枠を長押し → 確認アラートで削除        |
+
+### 状態更新と runOnJS
+- ジェスチャーから setState 等を呼ぶ場合は `runOnJS(handleOneFingerStart)(e.x, e.y)` のように UI スレッドから JS に渡す。
+
+---
+
+## 5. 再解析チャットのキーボード被り修正
+
+- `app/(tabs)/index.tsx` で、`SafeAreaView` 直下に **KeyboardAvoidingView**（iOS は `behavior="padding"`）を配置。
+
+---
+
+## 6. 今後の変更時の注意（ハルシネーション防止）
+
+- **未解答テストのフォールバック**: choices は `ensureChoices` で必ず 3〜4 件に補う。redaction_boxes は未解答時は空配列可。プロンプトに「解答が一切書かれていない場合は redaction_boxes を [] で返す」「不正解の選択肢（ダミー）を文脈から自動生成して choices を埋める」と指示済み。
+- **フラッシュカード保存**: 白塗りありのときは「スナップショット（view-shot）→ その URI を crop の入力」の順を崩さないこと。**Expo Go 環境でのクラッシュ防止**（isExpoGo での ViewShot スキップ、InteractionManager による遅延）のロジックは絶対に維持すること。
+- **RedactionEditor**: タッチ座標は**必ずコンテナ内ローカル（event.x / event.y）**で、`localToPercent` により 0〜100% に変換。指の真下と枠が 1:1 一致（DRAW_Y_OFFSET 等のオフセットは廃止済み）。1 本指 Pan の誤爆防止は **.minDistance(10)**（Pan に .minDuration は存在しない）。LongPress には `.maxPointers` を使わない（API に存在しない）。**1本指の移動・リサイズは未修正バグあり（セクション 0 参照）。**
+- **白抜き枠のサイズ**: プロンプトで「文字のインク部分だけを極限までタイトに囲むこと」と強調。parseRedactionBox の REDACTION_TIGHTEN_FACTOR (0.8) で約 20% タイト化。
+
+---
+
+## 7. クラッシュ防止策（フォールバックとガード）
+
+Expo Go や想定外レスポンスでネイティブクラッシュ・Unhandled Rejection を防ぐための実装。変更時は以下を崩さないこと。
+
+### 7.1 Expo Go 環境ガード（ネイティブモジュール不在）
+
+- **判定**: `lib/env.ts` の `isExpoGo()`（`Constants.appOwnership === 'expo'`）。Expo Go では AdMob・RevenueCat・ViewShot のネイティブモジュールが含まれないためクラッシュする。
+- **広告（lib/ads.ts）**
+  - `initMobileAds`: `isExpoGo()` のときは `mobileAds().initialize()` をスキップ。try-catch で import/initialize 失敗時もクラッシュさせない。
+  - `showInterstitialThen`: Expo Go のときは即 `onDone()` を呼び、インタースティシャルを表示しない。
+- **バナー表示（app/(tabs)/index.tsx）**
+  - `renderBanner`: Expo Go のときは本物の `<BannerAd />` ではなく、「広告エリア (テスト用)」と書いたグレーのプレースホルダー（`styles.bannerPlaceholder`）を表示。require 失敗時も同プレースホルダーにフォールバック。
+- **課金（lib/premium-context.tsx, app/(tabs)/explore.tsx）**
+  - PremiumProvider の useEffect / refresh: `isExpoGo()` のときは `Purchases.configure()` および `getCustomerInfo()` を一切呼ばず、`setIsPremium(false)` と `setIsLoading(false)` のみ。
+  - 設定画面の購入・復元: Expo Go のときは Alert で「Expo Go では課金は利用できません」と表示して return。
+
+### 7.2 フラッシュカード用スナップショット（ViewShot）の実行タイミング
+
+- スナップショットは**ユーザーが「フラッシュカードに保存」を押したとき**にのみ実行する。解析直後やバックグラウンドでは実行しない。
+- `saveAsFlashcards` 内で、白塗りありかつ **Expo Go でない** 場合のみ `captureRef` を実行。Expo Go ではスナップショットをスキップし、元の imageUri で crop（白塗りなしの画像で保存）。
+- `InteractionManager.runAfterInteractions` でキャプチャを遅延し、UI の更新が落ち着いてから実行して OOM/ネイティブクラッシュを軽減。
+- `captureRef` は try-catch で囲み、失敗時は元の imageUri で crop にフォールバック。
+
+### 7.3 解析 API・パースのエラーハンドリング（Unhandled Rejection 防止）
+
+- **lib/analyze-print.ts**
+  - `analyzePrintImage` / `reAnalyzeWithPrompt`: 全体を try-catch。`parseAnalyzeResponse` の呼び出しも try-catch し、JSON パース失敗時は「解析結果の形式が不正です。もう一度お試しください。」などのユーザー向け Error をスロー。
+  - `parseAnalyzeResponse` 内の `JSON.parse` を try-catch し、失敗時は明確な Error をスロー。
+- **app/(tabs)/index.tsx（analyzeImage）**
+  - 解析失敗時は `setErrorMessage` に加え、`Alert.alert('解析エラー', '読み取れませんでした。もう一度お試しください。', [{ text: 'OK' }])` を表示し、アプリはクラッシュせず元の画面に復帰。
+
+### 7.4 RedactionEditor の初期化エラー対策
+
+- **安全な初期値**: `imageWidth` / `imageHeight` が 0 や undefined の場合に NaN や 0 がネイティブに渡らないよう、`safeWidth = Math.max(1, Number(imageWidth) || 800)` / `safeHeight = Math.max(1, Number(imageHeight) || 600)` で aspectRatio を計算。
+- **aspectRatio**: `Number.isFinite(aspectRatio) ? aspectRatio : 1` を style に渡し、NaN を防ぐ。
+- 呼び出し元（index.tsx）では `imageWidth={imageWidth || 800}` / `imageHeight={imageHeight || 600}` を渡している。レイアウトが確定するまでジェスチャー内で `layoutRef.current` を参照しており、null のときは early return している。

@@ -26,13 +26,31 @@ export async function cropImageByRegion(
     Math.max(1, Math.floor((region.ymax - region.ymin) * imageHeight))
   );
 
-  const ctx = ImageManipulator.manipulate(imageUri);
-  ctx.crop({ originX, originY, width, height });
-  const ref = await ctx.renderAsync();
-  const saveResult = await ref.saveAsync({
-    compress: 0.85,
-    format: ImageManipulator.SaveFormat.JPEG,
+  console.log('[Flashcards] cropImageByRegion input', {
+    imageUri,
+    imageWidth,
+    imageHeight,
+    region,
+    cropRect: { originX, originY, width, height },
   });
-  const uri = (saveResult as { uri?: string } | undefined)?.uri;
-  return uri ?? imageUri;
+
+  try {
+    const result = await ImageManipulator.manipulateAsync(
+      imageUri,
+      [{ crop: { originX, originY, width, height } }],
+      {
+        compress: 0.85,
+        format: ImageManipulator.SaveFormat.JPEG,
+      }
+    );
+
+    console.log('[Flashcards] cropImageByRegion output', {
+      outputUri: result.uri,
+    });
+
+    return result.uri ?? imageUri;
+  } catch (e) {
+    console.error('[Flashcards] cropImageByRegion failed, fallback to original image', e);
+    return imageUri;
+  }
 }

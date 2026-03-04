@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "printapp_mobile",
+    "name": "パシャっと管理",
     "slug": "printapp_mobile",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -11,16 +11,16 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.kamekinglab.printapp",
+      "buildNumber": "1.0.0",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSUserTrackingUsageDescription": "広告のパーソナライズと測定のため、許可いただけると助かります。"
       }
     },
     "android": {
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+        "foregroundImage": "./assets/images/icon.png"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
@@ -28,7 +28,9 @@
         "android.permission.READ_CALENDAR",
         "android.permission.WRITE_CALENDAR",
         "android.permission.RECORD_AUDIO"
-      ]
+      ],
+      "package": "com.kamekinglab.printapp",
+      "versionCode": 1
     },
     "web": {
       "output": "static",
@@ -67,7 +69,8 @@
           "androidAppId": "ca-app-pub-8751260838396451~7655709564",
           "iosAppId": "ca-app-pub-8751260838396451~1161114671"
         }
-      ]
+      ],
+      "expo-tracking-transparency"
     ],
     "experiments": {
       "typedRoutes": true,
