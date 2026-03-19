@@ -4,17 +4,21 @@
  */
 
 import { Image } from 'expo-image';
+import { useAuthRequest } from 'expo-auth-session/providers/google';
 import * as Calendar from 'expo-calendar';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as Print from 'expo-print';
 import * as Share from 'expo-sharing';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import * as WebBrowser from 'expo-web-browser';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   InteractionManager,
   KeyboardAvoidingView,
+  Linking,
+  Modal,
   Platform,
   ScrollView,
   StyleSheet,
@@ -29,11 +33,28 @@ import { useRouter } from 'expo-router';
 import { RedactionEditor } from '@/components/redaction-editor';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { analyzePrintImage, reAnalyzeWithPrompt } from '@/lib/analyze-print';
+import { analyzePrintFromText, analyzePrintImage, reAnalyzeWithPrompt } from '@/lib/analyze-print';
 import { initMobileAds, showInterstitialThen, BANNER_UNIT_ID, isExpoGo } from '@/lib/ads';
+import { notifyCalendarRegistrationComplete } from '@/lib/calendar-notification';
+import {
+  getGoogleOAuthClientId,
+  getGoogleAuthSessionProxyRedirectUri,
+  createCalendarEvent,
+  type CreateEventPayload,
+} from '@/lib/google-calendar-api';
+import {
+  addOrUpdateLinkedAccount,
+  getValidLinkedAccounts,
+  getLinkedAccounts,
+  removeLinkedAccount,
+  type ValidLinkedAccount,
+  type StoredAccount,
+} from '@/lib/google-oauth-storage';
+import { fetchGoogleUserEmail } from '@/lib/google-userinfo';
 import { cropImageByRegion } from '@/lib/crop-image';
 import { captureRef } from 'react-native-view-shot';
 import { saveDeck } from '@/lib/flashcard-storage';
+import { recordSuccessAndMaybeRequestReview } from '@/lib/store-review-milestone';
 import { usePremium } from '@/lib/premium-context';
 import { Pastel } from '@/constants/theme';
 import type {
@@ -46,6 +67,22 @@ import type {
   RedactionBox,
 } from '@/lib/types';
 
+/** Google Calendar の既定色 + 標準イベントカラー11色（計12色）。隣同士が似た色にならないよう並び替え */
+const GOOGLE_CALENDAR_COLORS: { id: string; label: string; hex: string }[] = [
+  { id: '0', label: '既定', hex: '#4285F4' },
+  { id: '11', label: 'トマト', hex: '#D50000' },
+  { id: '5', label: 'バナナ', hex: '#F6BF26' },
+  { id: '2', label: 'セージ', hex: '#33B679' },
+  { id: '3', label: 'グレープ', hex: '#8E24AA' },
+  { id: '6', label: 'みかん', hex: '#F4511E' },
+  { id: '7', label: 'ピーコック', hex: '#039BE5' },
+  { id: '10', label: 'バジル', hex: '#0B8043' },
+  { id: '4', label: 'フラミンゴ', hex: '#E67C73' },
+  { id: '1', label: 'ラベンダー', hex: '#7986CB' },
+  { id: '8', label: 'グラファイト', hex: '#616161' },
+  { id: '9', label: 'ブルーベリー', hex: '#3F51B5' },
+];
+
 /** 編集可能なお知らせ1件（選択状態含む） */
 interface EditableOshiraseItem {
   eventName: string;
@@ -53,6 +90,12 @@ interface EditableOshiraseItem {
   endDate: string;
   memo: string;
   selected: boolean;
+  useCustomSettings: boolean;
+  customColor: string;
+  customMainReminder: 'none' | number;
+  customBackupReminder: 'none' | number;
+  /** 終日イベントとして登録する */
+  isAllDay: boolean;
 }
 
 /** テスト問題の選択状態付き */
@@ -61,9 +104,69 @@ interface SelectableProblem extends TestProblemItem {
 }
 
 function defaultEndDate(startISO: string): string {
-  const d = new Date(startISO);
+  const d = safeParseDate(startISO);
+  if (!d) return '';
   d.setHours(d.getHours() + 1);
-  return d.toISOString().slice(0, 19);
+  return dateToLocalISO(d);
+}
+
+/** ISO文字列をDateに変換（不正値はnullを返す） */
+function safeParseDate(iso: string): Date | null {
+  if (!iso || !iso.trim()) return null;
+  const text = iso.trim();
+  const localIso = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(text);
+  if (localIso) {
+    const year = Number(localIso[1]);
+    const month = Number(localIso[2]);
+    const day = Number(localIso[3]);
+    const hour = Number(localIso[4]);
+    const minute = Number(localIso[5]);
+    const second = Number(localIso[6] ?? '0');
+    const d = new Date(year, month - 1, day, hour, minute, second, 0);
+    if (
+      d.getFullYear() === year &&
+      d.getMonth() === month - 1 &&
+      d.getDate() === day &&
+      d.getHours() === hour &&
+      d.getMinutes() === minute
+    ) {
+      return d;
+    }
+    return null;
+  }
+  const d = new Date(text);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** 終了日時が開始日時より前なら開始の1時間後に自動補正 */
+function fixEndDateIfBefore(startISO: string, endISO: string): string {
+  const s = safeParseDate(startISO);
+  const e = safeParseDate(endISO);
+  if (!s || !e) return endISO;
+  if (e.getTime() <= s.getTime()) {
+    const fixed = new Date(s);
+    fixed.setHours(fixed.getHours() + 1);
+    return dateToLocalISO(fixed);
+  }
+  return endISO;
+}
+
+/** DateオブジェクトからISO的な文字列 (YYYY-MM-DDTHH:MM:SS) を返す */
+function dateToLocalISO(d: Date): string {
+  const pad2 = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}:00`;
+}
+
+/** 終日用: その日の 00:00 のISO文字列 */
+function dateToStartOfDayISO(d: Date): string {
+  const pad2 = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T00:00:00`;
+}
+
+/** 終日用: その日の 23:59 のISO文字列 */
+function dateToEndOfDayISO(d: Date): string {
+  const pad2 = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T23:59:00`;
 }
 
 const REMINDER_OPTIONS: { label: string; value: 'none' | number }[] = [
@@ -81,6 +184,136 @@ const REMINDER_OPTIONS: { label: string; value: 'none' | number }[] = [
 ];
 
 const FULLTEXT_HEADER = '\n\n【プリント原文】\n';
+
+/* ================================================================
+ *  DateTimePickerModal — 年・月・日・時・分を ▲▼ ボタンで選択
+ *  スクロール不使用のため iOS/Android ともに安定動作。
+ * ================================================================ */
+
+function daysInMonth(year: number, month: number): number {
+  return new Date(year, month, 0).getDate();
+}
+
+interface DateTimePickerModalProps {
+  visible: boolean;
+  value: Date;
+  onConfirm: (d: Date) => void;
+  onCancel: () => void;
+  title?: string;
+}
+
+function SpinnerCol({ value, min, max, onChange, suffix, width, pad }: {
+  value: number; min: number; max: number;
+  onChange: (v: number) => void; suffix: string; width: number; pad?: number;
+}) {
+  const wrap = (v: number) => (v < min ? max : v > max ? min : v);
+  return (
+    <View style={[pkS.col, { width }]}>
+      <TouchableOpacity style={pkS.arrow} onPress={() => onChange(wrap(value + 1))} activeOpacity={0.6}>
+        <Text style={pkS.arrowText}>▲</Text>
+      </TouchableOpacity>
+      <View style={pkS.valBox}>
+        <Text style={pkS.valText}>
+          {String(value).padStart(pad ?? 2, '0')}
+        </Text>
+        <Text style={pkS.suffixText}>{suffix}</Text>
+      </View>
+      <TouchableOpacity style={pkS.arrow} onPress={() => onChange(wrap(value - 1))} activeOpacity={0.6}>
+        <Text style={pkS.arrowText}>▼</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+function DateTimePickerModal({ visible, value, onConfirm, onCancel, title }: DateTimePickerModalProps) {
+  const [year, setYear] = useState(value.getFullYear());
+  const [month, setMonth] = useState(value.getMonth() + 1);
+  const [day, setDay] = useState(value.getDate());
+  const [hour, setHour] = useState(value.getHours());
+  const [minute, setMinute] = useState(Math.floor(value.getMinutes() / 5) * 5);
+
+  useEffect(() => {
+    if (visible) {
+      setYear(value.getFullYear());
+      setMonth(value.getMonth() + 1);
+      setDay(value.getDate());
+      setHour(value.getHours());
+      setMinute(Math.floor(value.getMinutes() / 5) * 5);
+    }
+  }, [visible, value]);
+
+  const maxDay = useMemo(() => daysInMonth(year, month), [year, month]);
+  useEffect(() => { if (day > maxDay) setDay(maxDay); }, [maxDay, day]);
+
+  const setMinuteWrap = useCallback((v: number) => {
+    if (v < 0) setMinute(55);
+    else if (v > 55) setMinute(0);
+    else setMinute(v);
+  }, []);
+
+  const handleConfirm = () => {
+    onConfirm(new Date(year, month - 1, Math.min(day, maxDay), hour, minute, 0));
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
+      <TouchableOpacity style={pkS.backdrop} activeOpacity={1} onPress={onCancel}>
+        <View style={pkS.container} onStartShouldSetResponder={() => true}>
+          <Text style={pkS.title}>{title || '日時を選択'}</Text>
+
+          <View style={pkS.dateRow}>
+            <SpinnerCol value={year} min={2024} max={2034} onChange={setYear} suffix="年" width={68} pad={4} />
+            <SpinnerCol value={month} min={1} max={12} onChange={setMonth} suffix="月" width={50} />
+            <SpinnerCol value={Math.min(day, maxDay)} min={1} max={maxDay} onChange={setDay} suffix="日" width={50} />
+          </View>
+
+          <View style={pkS.timeRow}>
+            <SpinnerCol value={hour} min={0} max={23} onChange={setHour} suffix="時" width={50} />
+            <Text style={pkS.timeSep}>:</Text>
+            <SpinnerCol value={minute} min={0} max={55} onChange={setMinuteWrap} suffix="分" width={50} />
+          </View>
+
+          <View style={pkS.preview}>
+            <Text style={pkS.previewText}>
+              {year}/{String(month).padStart(2, '0')}/{String(Math.min(day, maxDay)).padStart(2, '0')} {String(hour).padStart(2, '0')}:{String(minute).padStart(2, '0')}
+            </Text>
+          </View>
+
+          <View style={pkS.btnRow}>
+            <TouchableOpacity style={pkS.cancelBtn} onPress={onCancel} activeOpacity={0.8}>
+              <Text style={pkS.cancelBtnText}>キャンセル</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={pkS.confirmBtn} onPress={handleConfirm} activeOpacity={0.8}>
+              <Text style={pkS.confirmBtnText}>決定</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </TouchableOpacity>
+    </Modal>
+  );
+}
+
+const pkS = StyleSheet.create({
+  backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'center', alignItems: 'center' },
+  container: { backgroundColor: '#fff', borderRadius: 20, paddingVertical: 20, paddingHorizontal: 16, width: '88%', maxWidth: 340, alignItems: 'center' },
+  title: { fontSize: 16, fontWeight: '700', color: '#333', marginBottom: 16 },
+  dateRow: { flexDirection: 'row', alignItems: 'center', gap: 4, marginBottom: 12 },
+  timeRow: { flexDirection: 'row', alignItems: 'center', gap: 2, marginBottom: 12 },
+  timeSep: { fontSize: 22, fontWeight: '700', color: '#c97b63', marginHorizontal: 2, paddingBottom: 4 },
+  col: { alignItems: 'center' },
+  arrow: { paddingVertical: 6, paddingHorizontal: 12 },
+  arrowText: { fontSize: 18, color: '#c97b63', fontWeight: '600' },
+  valBox: { flexDirection: 'row', alignItems: 'baseline', backgroundColor: 'rgba(201,123,99,0.10)', borderRadius: 10, paddingVertical: 8, paddingHorizontal: 6, minWidth: 44, justifyContent: 'center' },
+  valText: { fontSize: 20, fontWeight: '700', color: '#c97b63' },
+  suffixText: { fontSize: 11, color: '#999', marginLeft: 1 },
+  preview: { backgroundColor: '#f8f0ec', borderRadius: 10, paddingVertical: 8, paddingHorizontal: 16, marginBottom: 16 },
+  previewText: { fontSize: 16, fontWeight: '600', color: '#333', letterSpacing: 0.5 },
+  btnRow: { flexDirection: 'row', gap: 12, width: '100%' },
+  cancelBtn: { flex: 1, paddingVertical: 12, borderRadius: 14, borderWidth: 1, borderColor: '#ccc', alignItems: 'center' },
+  cancelBtnText: { fontSize: 15, color: '#888', fontWeight: '600' },
+  confirmBtn: { flex: 1, paddingVertical: 12, borderRadius: 14, backgroundColor: '#c97b63', alignItems: 'center' },
+  confirmBtnText: { fontSize: 15, color: '#fff', fontWeight: '700' },
+});
 
 export default function HomeScreen() {
   const [imageUri, setImageUri] = useState<string | null>(null);
@@ -104,31 +337,177 @@ export default function HomeScreen() {
   const [analyzeProgress, setAnalyzeProgress] = useState<{ current: number; total: number } | null>(
     null
   );
-  const [bannerVisible, setBannerVisible] = useState(true);
+  const [bannerReloadToken, setBannerReloadToken] = useState(0);
+  const [adsReady, setAdsReady] = useState(false);
   const [reParseInput, setReParseInput] = useState('');
   const [reParsing, setReparsing] = useState(false);
   const [generatingPdf, setGeneratingPdf] = useState(false);
   const [showRedactionEditor, setShowRedactionEditor] = useState(false);
   const [pendingTestResult, setPendingTestResult] = useState<TestResult | null>(null);
+  const [calendarColor, setCalendarColor] = useState(GOOGLE_CALENDAR_COLORS[0].hex);
+  const [isGlobalSettingsEnabled, setIsGlobalSettingsEnabled] = useState(false);
+  const [useDeviceCalendar, setUseDeviceCalendar] = useState(false);
+  const [linkedAccounts, setLinkedAccounts] = useState<StoredAccount[]>([]);
+  const [selectedLinkedEmails, setSelectedLinkedEmails] = useState<string[]>([]);
+  const [loadingGoogleAuth, setLoadingGoogleAuth] = useState(false);
+  const [notifyOnCalendarComplete, setNotifyOnCalendarComplete] = useState(false);
+  const [showGoogleConsentModal, setShowGoogleConsentModal] = useState(false);
+  const [oauthIntent, setOauthIntent] = useState<'first' | 'add'>( 'first');
+  const [showPasteTextModal, setShowPasteTextModal] = useState(false);
+  const [pastedText, setPastedText] = useState('');
+  const [analyzingText, setAnalyzingText] = useState(false);
+  const [dtPickerVisible, setDtPickerVisible] = useState(false);
+  const [dtPickerTarget, setDtPickerTarget] = useState<{ index: number; field: 'eventDate' | 'endDate' }>({ index: 0, field: 'eventDate' });
   const flattenCaptureRef = useRef<View>(null);
+  const bannerRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const router = useRouter();
   const { isPremium } = usePremium();
 
+  const googleClientId = useMemo(() => {
+    try {
+      return getGoogleOAuthClientId(Platform.OS as 'ios' | 'android');
+    } catch {
+      return '';
+    }
+  }, []);
+
+  /** Android + Web Client ID: Google は https の redirect_uri のみ → Expo Auth プロキシ URLを使う */
+  const googleOAuthRedirectUri = useMemo(
+    () => getGoogleAuthSessionProxyRedirectUri(Platform.OS as 'ios' | 'android'),
+    []
+  );
+
+  const GOOGLE_OAUTH_SCOPES = useMemo(
+    () => [
+      'openid',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/calendar.events',
+    ],
+    []
+  );
+
+  const [googleAuthRequest, googleAuthResponse, promptGoogleLogin] = useAuthRequest(
+    {
+      clientId: googleClientId,
+      scopes: GOOGLE_OAUTH_SCOPES,
+      extraParams: {
+        access_type: 'offline',
+        prompt: 'select_account consent',
+      },
+      ...(googleOAuthRedirectUri ? { redirectUri: googleOAuthRedirectUri } : {}),
+    },
+    { scheme: 'printappmobile' }
+  );
+
   useEffect(() => {
-    initMobileAds(isPremium).catch(() => {});
+    WebBrowser.maybeCompleteAuthSession();
+  }, []);
+
+  useEffect(() => {
+    if (
+      !googleAuthResponse ||
+      googleAuthResponse.type !== 'success' ||
+      !googleAuthResponse.authentication?.accessToken
+    ) {
+      return;
+    }
+    const auth = googleAuthResponse.authentication;
+    const token = auth.accessToken;
+    setOauthIntent('first');
+    setLoadingGoogleAuth(true);
+    fetchGoogleUserEmail(token)
+      .then((email) => {
+        const config = auth.getRequestConfig();
+        return addOrUpdateLinkedAccount({
+          email,
+          accessToken: config.accessToken,
+          refreshToken: config.refreshToken,
+          expiresIn: config.expiresIn,
+          issuedAt: config.issuedAt,
+        }).then(() => email);
+      })
+      .then((email) =>
+        getLinkedAccounts().then((all) => {
+          setLinkedAccounts(all);
+          setSelectedLinkedEmails((prev) =>
+            prev.includes(email) ? prev : [...prev, email]
+          );
+        })
+      )
+      .catch((e) => {
+        console.warn('[Calendar] OAuth follow-up failed', e);
+        Alert.alert(
+          'エラー',
+          e instanceof Error ? e.message : '連携の処理に失敗しました。'
+        );
+      })
+      .finally(() => setLoadingGoogleAuth(false));
+  }, [googleAuthResponse, googleClientId]);
+
+  const hasRestoredLinkedAccountsRef = useRef(false);
+  useEffect(() => {
+    if (!googleClientId || hasRestoredLinkedAccountsRef.current) return;
+    hasRestoredLinkedAccountsRef.current = true;
+    getLinkedAccounts()
+      .then((all) => {
+        if (all.length === 0) return;
+        setLinkedAccounts(all);
+        setSelectedLinkedEmails(all.map((a) => a.email));
+      })
+      .catch(() => {});
+  }, [googleClientId]);
+
+  useEffect(() => {
+    console.log('[Ads] initMobileAds called. isPremium=', isPremium);
+    let cancelled = false;
+    initMobileAds(isPremium)
+      .then(() => {
+        if (!cancelled) {
+          console.log('[Ads] SDK ready, enabling banner');
+          setAdsReady(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setAdsReady(true);
+      });
+    return () => { cancelled = true; };
   }, [isPremium]);
+
+  useEffect(() => {
+    return () => {
+      if (bannerRetryTimerRef.current) {
+        clearTimeout(bannerRetryTimerRef.current);
+        bannerRetryTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (result?.type === 'お知らせ') {
       const events = (result as OshiraseResult).events;
+      const today = new Date();
+      const todayStart = dateToStartOfDayISO(today);
+      const todayEnd = dateToEndOfDayISO(today);
       setEditedEvents(
-        events.map((e) => ({
-          eventName: e.eventName,
-          eventDate: e.eventDate,
-          endDate: e.eventEndDate ?? defaultEndDate(e.eventDate),
-          memo: e.memo ?? '',
-          selected: true,
-        }))
+        events.map((e) => {
+          const dateUnknown = !e.eventDate || !safeParseDate(e.eventDate);
+          const startISO = dateUnknown ? todayStart : e.eventDate;
+          const rawEnd = e.eventEndDate ?? (dateUnknown ? todayEnd : defaultEndDate(e.eventDate));
+          const endDate = fixEndDateIfBefore(startISO, rawEnd);
+          return {
+            eventName: e.eventName,
+            eventDate: startISO,
+            endDate,
+            memo: e.memo ?? '',
+            selected: true,
+            useCustomSettings: false,
+            customColor: GOOGLE_CALENDAR_COLORS[0].hex,
+            customMainReminder: 'none' as const,
+            customBackupReminder: 'none' as const,
+            isAllDay: dateUnknown,
+          };
+        })
       );
       setMainReminder('none');
       setBackupReminder('none');
@@ -232,109 +611,130 @@ export default function HomeScreen() {
   }, [requestMediaLibraryPermission]);
 
   const analyzeImage = useCallback(async () => {
+    if (analyzing) return;
     if (!imageUri && selectedImages.length === 0) return;
+
     setAnalyzing(true);
     setResult(null);
     setErrorMessage(null);
     setAnalyzeProgress(null);
 
-    try {
-      const targets =
-        selectedImages.length > 0
-          ? selectedImages
-          : imageUri
-          ? [
-              {
-                uri: imageUri,
-                base64: imageBase64,
-                width: imageWidth,
-                height: imageHeight,
-              },
-            ]
-          : [];
+    let finalResult: AnalyzeResult | null = null;
+    let analysisDone = false;
+    let adDone = false;
 
-      if (targets.length === 0) {
-        throw new Error('解析する画像が選択されていません。');
-      }
-
-      const total = targets.length;
-      const allProblems: TestProblemItem[] = [];
-      const allOshiraseEvents: OshiraseResult['events'] = [];
-      const testImageData: { uri: string; base64: string; redaction_boxes: RedactionBox[] }[] = [];
-      let oshiraseFullText = '';
-      let summaryTitle = '';
-      let subject = '';
-      let date = '';
-
-      for (let i = 0; i < targets.length; i++) {
-        const target = targets[i];
-        setAnalyzeProgress({ current: i + 1, total });
-        let base64 = target.base64 ?? '';
-        if (!base64 || base64.length === 0) {
-          base64 = await FileSystemLegacy.readAsStringAsync(target.uri, {
-            encoding: FileSystemLegacy.EncodingType.Base64,
-          });
-        }
-        if (!base64 || base64.length === 0) {
-          throw new Error('画像の Base64 データを取得できませんでした。');
-        }
-        const analyzed = await analyzePrintImage(base64, 'image/jpeg');
-        if (analyzed.type === 'テスト') {
-          const tr = analyzed as TestResult;
-          if (!summaryTitle) summaryTitle = tr.summaryTitle ?? '';
-          if (!subject) subject = tr.subject ?? '';
-          if (!date) date = tr.date ?? '';
-          allProblems.push(...tr.problems);
-          testImageData.push({
-            uri: target.uri,
-            base64,
-            redaction_boxes: tr.redaction_boxes ?? [],
-          });
-        } else {
-          const osh = analyzed as OshiraseResult;
-          allOshiraseEvents.push(...osh.events);
-          if (osh.fullText) oshiraseFullText += (oshiraseFullText ? '\n\n' : '') + osh.fullText;
-        }
-      }
-
-      let finalResult: AnalyzeResult;
-      if (allProblems.length > 0) {
-        finalResult = {
-          type: 'テスト',
-          summaryTitle: summaryTitle || testSummaryTitle || 'テスト',
-          subject: subject || testSubject || 'その他',
-          date: date || testDate || '',
-          problems: allProblems,
-          testImageData,
-        };
-      } else if (allOshiraseEvents.length > 0) {
-        finalResult = {
-          type: 'お知らせ',
-          fullText: oshiraseFullText || '（抽出された予定一覧）',
-          events: allOshiraseEvents,
-        };
-      } else {
-        throw new Error('解析結果から問題または予定を抽出できませんでした。');
-      }
-
-      showInterstitialThen(() => {
-        setAnalyzeProgress(null);
-        setAnalyzing(false);
-        if (finalResult.type === 'テスト' && (finalResult as TestResult).testImageData?.length) {
-          setPendingTestResult(finalResult as TestResult);
-          setShowRedactionEditor(true);
-        } else {
-          setResult(finalResult);
-        }
-      }, isPremium);
-    } catch (e) {
+    const finishIfReady = () => {
+      if (!analysisDone || !adDone || !finalResult) return;
       setAnalyzeProgress(null);
       setAnalyzing(false);
-      const message = e instanceof Error ? e.message : '解析に失敗しました。';
-      setErrorMessage(message);
-      Alert.alert('解析エラー', '読み取れませんでした。もう一度お試しください。', [{ text: 'OK' }]);
-    }
+      if (finalResult.type === 'テスト' && (finalResult as TestResult).testImageData?.length) {
+        setPendingTestResult(finalResult as TestResult);
+        setShowRedactionEditor(true);
+      } else {
+        setResult(finalResult);
+      }
+      void recordSuccessAndMaybeRequestReview();
+    };
+
+    const runParse = async () => {
+      try {
+        const targets =
+          selectedImages.length > 0
+            ? selectedImages
+            : imageUri
+            ? [
+                {
+                  uri: imageUri,
+                  base64: imageBase64,
+                  width: imageWidth,
+                  height: imageHeight,
+                },
+              ]
+            : [];
+
+        if (targets.length === 0) {
+          throw new Error('解析する画像が選択されていません。');
+        }
+
+        const total = targets.length;
+        const allProblems: TestProblemItem[] = [];
+        const allOshiraseEvents: OshiraseResult['events'] = [];
+        const testImageData: { uri: string; base64: string; redaction_boxes: RedactionBox[] }[] = [];
+        let oshiraseFullText = '';
+        let summaryTitle = '';
+        let subject = '';
+        let date = '';
+
+        for (let i = 0; i < targets.length; i++) {
+          const target = targets[i];
+          setAnalyzeProgress({ current: i + 1, total });
+          let base64 = target.base64 ?? '';
+          if (!base64 || base64.length === 0) {
+            base64 = await FileSystemLegacy.readAsStringAsync(target.uri, {
+              encoding: FileSystemLegacy.EncodingType.Base64,
+            });
+          }
+          if (!base64 || base64.length === 0) {
+            throw new Error('画像の Base64 データを取得できませんでした。');
+          }
+          const analyzed = await analyzePrintImage(base64, 'image/jpeg');
+          if (analyzed.type === 'テスト') {
+            const tr = analyzed as TestResult;
+            if (!summaryTitle) summaryTitle = tr.summaryTitle ?? '';
+            if (!subject) subject = tr.subject ?? '';
+            if (!date) date = tr.date ?? '';
+            allProblems.push(...tr.problems);
+            testImageData.push({
+              uri: target.uri,
+              base64,
+              redaction_boxes: tr.redaction_boxes ?? [],
+            });
+          } else {
+            const osh = analyzed as OshiraseResult;
+            allOshiraseEvents.push(...osh.events);
+            if (osh.fullText) oshiraseFullText += (oshiraseFullText ? '\n\n' : '') + osh.fullText;
+          }
+        }
+
+        if (allProblems.length > 0) {
+          finalResult = {
+            type: 'テスト',
+            summaryTitle: summaryTitle || testSummaryTitle || 'テスト',
+            subject: subject || testSubject || 'その他',
+            date: date || testDate || '',
+            problems: allProblems,
+            testImageData,
+          };
+        } else if (allOshiraseEvents.length > 0) {
+          finalResult = {
+            type: 'お知らせ',
+            fullText: oshiraseFullText || '（抽出された予定一覧）',
+            events: allOshiraseEvents,
+          };
+        } else {
+          throw new Error('解析結果から問題または予定を抽出できませんでした。');
+        }
+        analysisDone = true;
+        finishIfReady();
+      } catch (e) {
+        setAnalyzeProgress(null);
+        setAnalyzing(false);
+        const message = e instanceof Error ? e.message : '解析に失敗しました。';
+        setErrorMessage(message);
+        Alert.alert('解析エラー', '読み取れませんでした。もう一度お試しください。', [{ text: 'OK' }]);
+      }
+    };
+
+    // 解析処理をバックグラウンドで開始
+    runParse();
+
+    // すぐにインタースティシャル広告を表示（閉じたら finishIfReady を確認）
+    showInterstitialThen(() => {
+      adDone = true;
+      finishIfReady();
+    }, isPremium);
   }, [
+    analyzing,
     imageUri,
     imageBase64,
     imageWidth,
@@ -346,9 +746,24 @@ export default function HomeScreen() {
     isPremium,
   ]);
 
-  const updateEditedEvent = useCallback((index: number, field: keyof EditableOshiraseItem, value: string | boolean) => {
+  const updateEditedEvent = useCallback((index: number, field: keyof EditableOshiraseItem, value: string | boolean | number) => {
     setEditedEvents((prev) =>
-      prev.map((item, i) => (i === index ? { ...item, [field]: value } : item))
+      prev.map((item, i) => {
+        if (i !== index) return item;
+        const updated = { ...item, [field]: value };
+        if (field === 'eventDate' && typeof value === 'string') {
+          updated.endDate = fixEndDateIfBefore(value, updated.endDate);
+        }
+        if (field === 'endDate' && typeof value === 'string') {
+          updated.endDate = fixEndDateIfBefore(updated.eventDate, value);
+        }
+        if (field === 'isAllDay' && value === true) {
+          const d = safeParseDate(item.eventDate) || new Date();
+          updated.eventDate = dateToStartOfDayISO(d);
+          updated.endDate = dateToEndOfDayISO(d);
+        }
+        return updated;
+      })
     );
   }, []);
 
@@ -364,68 +779,198 @@ export default function HomeScreen() {
     );
   }, []);
 
+  const openDateTimePicker = useCallback((index: number, field: 'eventDate' | 'endDate') => {
+    setDtPickerTarget({ index, field });
+    setDtPickerVisible(true);
+  }, []);
+
+  const handleDateTimePicked = useCallback((d: Date) => {
+    setDtPickerVisible(false);
+    const iso = dateToLocalISO(d);
+    updateEditedEvent(dtPickerTarget.index, dtPickerTarget.field, iso);
+  }, [dtPickerTarget, updateEditedEvent]);
+
+  /** 1回の登録完了後に呼ぶ。選択状態のみリセット（連携アカウントは残す）。 */
+  const cleanupCalendarStateAfterRegistration = useCallback(() => {
+    setSelectedLinkedEmails(linkedAccounts.map((a) => a.email));
+  }, [linkedAccounts]);
+
+  /** 端末の標準カレンダーIDを取得（iOS: デフォルト / Android: ローカルプライマリ） */
+  const getDeviceCalendarId = useCallback(async (): Promise<string | null> => {
+    const { status } = await Calendar.requestCalendarPermissionsAsync();
+    if (status !== 'granted') return null;
+    const calendars = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
+    const writable = calendars.filter((c) => c.allowsModifications);
+    if (writable.length === 0) return null;
+    if (Platform.OS === 'ios') {
+      try {
+        const def = await Calendar.getDefaultCalendarAsync();
+        return def?.id ?? writable[0]?.id ?? null;
+      } catch {
+        const local = writable.find((c) => c.source?.type === 'local') ?? writable[0];
+        return local?.id ?? null;
+      }
+    }
+    const primary = writable.find((c) => (c as { isPrimary?: boolean }).isPrimary === true);
+    if (primary) return primary.id;
+    const local = writable.find((c) => c.source?.type === 'local');
+    return (local ?? writable[0])?.id ?? null;
+  }, []);
+
   const addToCalendar = useCallback(async () => {
     const selectedItems = editedEvents.filter((e) => e.selected);
     if (selectedItems.length === 0) {
       Alert.alert('確認', 'カレンダーに登録する予定を1件以上選択してください。');
       return;
     }
-    try {
-      const { status } = await Calendar.requestCalendarPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert(
-          'カレンダーの許可',
-          'カレンダーに予定を追加するには、設定でカレンダーへのアクセスを許可してください。',
-          [{ text: 'OK' }]
-        );
+
+    for (const item of selectedItems) {
+      const s = safeParseDate(item.eventDate);
+      const e = safeParseDate(item.endDate);
+      if (!s) {
+        Alert.alert('日時エラー', `「${item.eventName || '（無題）'}」の開始日時が正しくありません。`);
         return;
       }
-      let calendarId: string;
-      if (Platform.OS === 'ios') {
-        const defaultCalendar = await Calendar.getDefaultCalendarAsync();
-        calendarId = defaultCalendar.id;
-      } else {
-        const calendars = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
-        const writableList = calendars.filter((c) => c.allowsModifications);
-        if (writableList.length === 0) {
-          Alert.alert('エラー', '書き込み可能なカレンダーが見つかりませんでした。');
-          return;
-        }
-        const primaryOrFirst =
-          writableList.find((c) => (c as { isPrimary?: boolean }).isPrimary === true) ??
-          writableList[0];
-        calendarId = primaryOrFirst.id;
+      if (!e) {
+        Alert.alert('日時エラー', `「${item.eventName || '（無題）'}」の終了日時が正しくありません。`);
+        return;
       }
-
-      const alarmOffsets = [mainReminder, backupReminder]
-        .filter((x): x is number => x !== 'none')
-        .slice(0, 2);
-      const alarms = alarmOffsets.map((relativeOffset) => ({ relativeOffset }));
-
-      const fullText =
-        result && result.type === 'お知らせ' ? (result as OshiraseResult).fullText : '';
-      const fullTextSuffix = fullText ? FULLTEXT_HEADER + fullText : '';
-
-      for (const item of selectedItems) {
-        const startDate = new Date(item.eventDate);
-        const endDate = new Date(item.endDate);
-        const notes = (item.memo || '').trim() + fullTextSuffix;
-        await Calendar.createEventAsync(calendarId, {
-          title: item.eventName.trim() || '（無題）',
-          startDate,
-          endDate,
-          notes: notes || undefined,
-          alarms,
-        });
+      if (e.getTime() <= s.getTime()) {
+        Alert.alert('日時エラー', `「${item.eventName || '（無題）'}」の終了日時が開始日時より前になっています。終了日時を修正してください。`);
+        return;
       }
-      Alert.alert('成功', `カレンダーに${selectedItems.length}件の予定を登録しました！`);
-    } catch (e) {
-      Alert.alert(
-        'エラー',
-        e instanceof Error ? e.message : 'カレンダーへの登録に失敗しました。'
-      );
     }
-  }, [editedEvents, mainReminder, backupReminder, result]);
+
+    if (!useDeviceCalendar && selectedLinkedEmails.length === 0) {
+      Alert.alert('確認', '登録先に「端末の標準カレンダー」または「Googleカレンダー」を1つ以上選択してください。');
+      return;
+    }
+
+    const fullText =
+      result && result.type === 'お知らせ' ? (result as OshiraseResult).fullText : '';
+    const fullTextSuffix = fullText ? FULLTEXT_HEADER + fullText : '';
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Tokyo';
+
+    type Task = () => Promise<void>;
+    const tasks: Task[] = [];
+
+    if (useDeviceCalendar) {
+      const deviceCalId = await getDeviceCalendarId();
+      if (!deviceCalId) {
+        Alert.alert('カレンダーの許可', '端末のカレンダーに追加するには、設定でカレンダーへのアクセスを許可してください。', [{ text: 'OK' }]);
+        return;
+      }
+      for (const item of selectedItems) {
+        const startDate = safeParseDate(item.eventDate)!;
+        let endDate = safeParseDate(item.endDate)!;
+        if (item.isAllDay) {
+          endDate = new Date(startDate);
+          endDate.setDate(endDate.getDate() + 1);
+          endDate.setHours(0, 0, 0, 0);
+        }
+        const effectiveMain = isGlobalSettingsEnabled ? mainReminder : item.customMainReminder;
+        const effectiveBackup = isGlobalSettingsEnabled ? backupReminder : item.customBackupReminder;
+        const reminderMinutes = [effectiveMain, effectiveBackup]
+          .filter((x): x is number => x !== 'none')
+          .slice(0, 2);
+        const alarms = reminderMinutes.map((minutes) => ({ relativeOffset: -Math.abs(minutes) }));
+        const notes = (item.memo || '').trim() + fullTextSuffix;
+        tasks.push(() =>
+          Calendar.createEventAsync(deviceCalId, {
+            title: item.eventName.trim() || '（無題）',
+            startDate,
+            endDate,
+            notes: notes || undefined,
+            alarms,
+            ...(item.isAllDay ? { allDay: true } : {}),
+          }).then(() => {})
+        );
+      }
+    }
+
+    if (selectedLinkedEmails.length > 0) {
+      let selectedValid: ValidLinkedAccount[];
+      try {
+        const valid = await getValidLinkedAccounts(googleClientId, GOOGLE_OAUTH_SCOPES);
+        selectedValid = valid.filter((a) => selectedLinkedEmails.includes(a.email));
+      } catch {
+        Alert.alert('エラー', 'アカウント情報の取得に失敗しました。');
+        return;
+      }
+      if (selectedValid.length === 0) {
+        Alert.alert('確認', '選択したアカウントのトークンが無効です。再度ログインするか、別のアカウントを選択してください。');
+        return;
+      }
+      const pad2 = (n: number) => String(n).padStart(2, '0');
+      for (const item of selectedItems) {
+        const startDate = safeParseDate(item.eventDate)!;
+        let endDate = safeParseDate(item.endDate)!;
+        if (item.isAllDay) {
+          endDate = new Date(startDate);
+          endDate.setDate(endDate.getDate() + 1);
+          endDate.setHours(0, 0, 0, 0);
+        }
+        const summary = item.eventName.trim() || '（無題）';
+        const description = (item.memo || '').trim() + fullTextSuffix || undefined;
+        const effectiveColorHex = isGlobalSettingsEnabled ? calendarColor : item.customColor;
+        const effectiveMain = isGlobalSettingsEnabled ? mainReminder : item.customMainReminder;
+        const effectiveBackup = isGlobalSettingsEnabled ? backupReminder : item.customBackupReminder;
+        const colorId = GOOGLE_CALENDAR_COLORS.find((c) => c.hex === effectiveColorHex)?.id;
+        const reminderMinutes = [effectiveMain, effectiveBackup]
+          .filter((x): x is number => x !== 'none')
+          .slice(0, 2);
+        const reminders = {
+          useDefault: false,
+          overrides: reminderMinutes.map((minutes) => ({ method: 'popup' as const, minutes: Math.abs(minutes) })),
+        };
+        const endDateOnly =
+          `${endDate.getFullYear()}-${pad2(endDate.getMonth() + 1)}-${pad2(endDate.getDate())}`;
+        const payload: CreateEventPayload = item.isAllDay
+          ? {
+              summary,
+              description,
+              start: { date: item.eventDate.slice(0, 10) },
+              end: { date: endDateOnly },
+              ...(colorId ? { colorId } : {}),
+              reminders,
+            }
+          : {
+              summary,
+              description,
+              start: { dateTime: item.eventDate, timeZone: tz },
+              end: { dateTime: dateToLocalISO(endDate), timeZone: tz },
+              ...(colorId ? { colorId } : {}),
+              reminders,
+            };
+        for (const { accessToken } of selectedValid) {
+          tasks.push(() => createCalendarEvent(accessToken, 'primary', payload).then(() => undefined));
+        }
+      }
+    }
+
+    try {
+      await Promise.all(tasks.map((t) => t()));
+    } catch (e) {
+      console.warn('[Calendar] registration error', e);
+      const msg = e instanceof Error ? e.message : '';
+      if (msg.includes('401') || msg.includes('invalid') || msg.includes('token')) {
+        Alert.alert('ログインの有効期限', '該当アカウントの連携を解除し、再度「Googleで連携する」からログインしてください。');
+        getLinkedAccounts().then(setLinkedAccounts).catch(() => {});
+      } else {
+        Alert.alert('エラー', msg || 'カレンダーへの登録に失敗しました。');
+      }
+      return;
+    }
+
+    const parts: string[] = [];
+    if (useDeviceCalendar) parts.push('端末');
+    if (selectedLinkedEmails.length > 0) parts.push(`Google${selectedLinkedEmails.length > 1 ? `（${selectedLinkedEmails.length}件）` : ''}`);
+    Alert.alert('成功', `${parts.join('・')}に${selectedItems.length}件の予定を登録しました！`);
+    if (notifyOnCalendarComplete) {
+      notifyCalendarRegistrationComplete(selectedItems.length).catch(() => {});
+    }
+    cleanupCalendarStateAfterRegistration();
+  }, [editedEvents, result, calendarColor, mainReminder, backupReminder, isGlobalSettingsEnabled, useDeviceCalendar, linkedAccounts, selectedLinkedEmails, googleClientId, GOOGLE_OAUTH_SCOPES, notifyOnCalendarComplete, cleanupCalendarStateAfterRegistration, getDeviceCalendarId]);
 
   const saveAsFlashcards = useCallback(async () => {
     const selected = selectableProblems.filter((p) => p.selected);
@@ -475,7 +1020,7 @@ export default function HomeScreen() {
               text: prob.text,
               imageRegion: prob.imageRegion,
             });
-            imageUriOut = await cropImageByRegion(sourceUri, w, h, prob.imageRegion);
+            imageUriOut = await cropImageByRegion(imageUri, w, h, prob.imageRegion);
           } catch (e) {
             console.error('[Flashcards] Failed to crop image for problem', {
               text: prob.text,
@@ -543,10 +1088,7 @@ export default function HomeScreen() {
       );
     } catch (e) {
       console.error('[Flashcards] Failed to save deck', e);
-      Alert.alert(
-        'エラー',
-        e instanceof Error ? e.message : 'フラッシュカードの保存に失敗しました。'
-      );
+      Alert.alert('エラー', 'フラッシュカードの保存に失敗しました。しばらく経ってから再度お試しください。');
     } finally {
       setSavingCards(false);
     }
@@ -616,16 +1158,15 @@ export default function HomeScreen() {
           )
           .join('');
         const pageBreak = pageIndex < items.length - 1 ? 'page-break-after:always;' : '';
-        return `<div style="position:relative;width:100%;${pageBreak}"><img src="${imgSrc}" style="width:100%;display:block;position:relative;" /><div style="position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;">${overlayDivs}</div></div>`;
+        return `<div style="position:relative;width:100%;height:100vh;box-sizing:border-box;${pageBreak}"><img src="${imgSrc}" style="display:block;max-height:100vh;max-width:100vw;width:100%;height:auto;object-fit:contain;margin:0 auto;vertical-align:bottom;" /><div style="position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;">${overlayDivs}</div></div>`;
       });
-      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{margin:0;padding:0;} @media print { div { page-break-after: always; } div:last-child { page-break-after: auto; } }</style></head><body>${pageHtmls.join('')}</body></html>`;
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>@page{margin:0;}*{margin:0;padding:0;box-sizing:border-box;}html,body{margin:0;padding:0;height:100vh;overflow:hidden;}img{display:block;max-height:100vh;max-width:100vw;object-fit:contain;margin:0 auto;vertical-align:bottom;}</style></head><body>${pageHtmls.join('')}</body></html>`;
       const { uri } = await Print.printToFileAsync({ html });
       await Share.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: '復習用PDFを保存' });
+      void recordSuccessAndMaybeRequestReview();
     } catch (e) {
-      Alert.alert(
-        'PDFの生成に失敗しました',
-        e instanceof Error ? e.message : '不明なエラーです。'
-      );
+      console.warn('[PDF] generation error', e);
+      Alert.alert('エラー', 'PDFの生成に失敗しました。しばらく経ってから再度お試しください。');
     } finally {
       setGeneratingPdf(false);
     }
@@ -659,6 +1200,7 @@ export default function HomeScreen() {
       const newResult = await reAnalyzeWithPrompt(base64, 'image/jpeg', prompt);
       setResult(newResult);
       setReParseInput('');
+      void recordSuccessAndMaybeRequestReview();
     } catch (e) {
       setErrorMessage(e instanceof Error ? e.message : '再解析に失敗しました。');
     } finally {
@@ -689,7 +1231,8 @@ export default function HomeScreen() {
   );
 
   const renderBanner = () => {
-    if (isPremium || !bannerVisible) return null;
+    if (isPremium) return null;
+    if (!adsReady) return null;
     if (isExpoGo()) {
       return (
         <View style={styles.bannerPlaceholder}>
@@ -705,13 +1248,24 @@ export default function HomeScreen() {
       return (
         <View style={styles.bannerWrapper}>
           <Banner
+            key={`banner-${bannerReloadToken}`}
             unitId={unitId}
             size={size}
             requestOptions={{ requestNonPersonalizedAdsOnly: false }}
-            onAdLoaded={() => {}}
-            onAdFailedToLoad={() => {
-              console.error('[Ads] Banner failed to load - hiding banner');
-              setBannerVisible(false);
+            onAdLoaded={() => {
+              if (bannerRetryTimerRef.current) {
+                clearTimeout(bannerRetryTimerRef.current);
+                bannerRetryTimerRef.current = null;
+              }
+            }}
+            onAdFailedToLoad={(error: unknown) => {
+              console.error('[Ads] Banner failed to load - retrying', error);
+              if (bannerRetryTimerRef.current) {
+                clearTimeout(bannerRetryTimerRef.current);
+              }
+              bannerRetryTimerRef.current = setTimeout(() => {
+                setBannerReloadToken((prev) => prev + 1);
+              }, 4500);
             }}
           />
         </View>
@@ -745,7 +1299,7 @@ export default function HomeScreen() {
               プリント管理
             </ThemedText>
             <ThemedText style={styles.subtitle}>
-              カメラで撮影するか、アルバムから画像を選んで解析します。
+              カメラで撮影、アルバムから画像を選ぶ、またはテキストを貼り付けて解析します。
             </ThemedText>
 
           <View style={styles.buttonRow}>
@@ -755,7 +1309,132 @@ export default function HomeScreen() {
             <TouchableOpacity style={styles.primaryButton} onPress={pickFromAlbum} activeOpacity={0.8}>
               <ThemedText style={styles.primaryButtonText}>アルバムから選ぶ</ThemedText>
             </TouchableOpacity>
+            <TouchableOpacity style={styles.primaryButton} onPress={() => setShowPasteTextModal(true)} activeOpacity={0.8}>
+              <ThemedText style={styles.primaryButtonText}>テキストを貼り付け</ThemedText>
+            </TouchableOpacity>
           </View>
+
+          <Modal visible={showPasteTextModal} transparent animationType="fade">
+            <View style={styles.modalOverlay}>
+              <View style={styles.pasteModalContent}>
+                <ThemedText style={styles.pasteModalTitle}>テキストを貼り付けて解析</ThemedText>
+                <TextInput
+                  style={styles.pasteTextInput}
+                  placeholder="プリントの内容をコピーしてここに貼り付けてください"
+                  placeholderTextColor="#999"
+                  multiline
+                  numberOfLines={6}
+                  value={pastedText}
+                  onChangeText={setPastedText}
+                  editable={!analyzingText}
+                />
+                <View style={styles.pasteModalButtons}>
+                  <TouchableOpacity
+                    style={styles.pasteModalButtonCancel}
+                    onPress={() => { setShowPasteTextModal(false); setPastedText(''); setErrorMessage(null); }}
+                    disabled={analyzingText}
+                  >
+                    <ThemedText style={styles.pasteModalButtonCancelText}>キャンセル</ThemedText>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.pasteModalButtonSubmit, analyzingText && styles.pasteModalButtonDisabled]}
+                    onPress={async () => {
+                      if (!pastedText.trim()) {
+                        setErrorMessage('テキストを入力してください。');
+                        return;
+                      }
+                      setAnalyzingText(true);
+                      setErrorMessage(null);
+                      try {
+                        const analyzed = await analyzePrintFromText(pastedText);
+                        setResult(analyzed);
+                        setShowPasteTextModal(false);
+                        setPastedText('');
+                        void recordSuccessAndMaybeRequestReview();
+                      } catch (e) {
+                        setErrorMessage(e instanceof Error ? e.message : '解析に失敗しました。');
+                      } finally {
+                        setAnalyzingText(false);
+                      }
+                    }}
+                    disabled={analyzingText}
+                  >
+                    {analyzingText ? (
+                      <ActivityIndicator color="#fff" size="small" />
+                    ) : (
+                      <ThemedText style={styles.pasteModalButtonSubmitText}>解析する</ThemedText>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          </Modal>
+
+          <Modal visible={showGoogleConsentModal} transparent animationType="fade">
+            <View style={styles.consentModalOverlay}>
+              <View style={styles.consentModalContent}>
+                <ScrollView showsVerticalScrollIndicator={false}>
+                  <ThemedText
+                    style={styles.consentModalTitle}
+                    lightColor={Pastel.coralStrong}
+                    darkColor={Pastel.coralStrong}
+                  >
+                    【Googleカレンダー連携の手順】
+                  </ThemedText>
+                  <ThemedText
+                    style={styles.consentModalBody}
+                    lightColor="#333333"
+                    darkColor="#333333"
+                  >
+                    連携時にGoogleの確認画面が表示される場合があります。その際は以下の手順で進めてください。
+                  </ThemedText>
+                  <ThemedText style={styles.consentModalStep} lightColor="#333333" darkColor="#333333">
+                    ① アカウントを選択する
+                  </ThemedText>
+                  <ThemedText style={styles.consentModalStep} lightColor="#333333" darkColor="#333333">
+                    ②「Google ではこのアプリを確認していません」という画面が出た場合、左下の「詳細」をタップする
+                  </ThemedText>
+                  <ThemedText style={styles.consentModalStep} lightColor="#333333" darkColor="#333333">
+                    ③「パシャっと管理（安全ではないページ）に移動」をタップする
+                  </ThemedText>
+                  <ThemedText style={styles.consentModalStep} lightColor="#333333" darkColor="#333333">
+                    ④（ログイン画面が出た場合は次へ進む）
+                  </ThemedText>
+                  <ThemedText style={styles.consentModalStep} lightColor="#333333" darkColor="#333333">
+                    ⑤ パシャっと管理がアクセスを求めています、の画面で【チェックボックスをすべて選択】して「続行」をタップする
+                  </ThemedText>
+                </ScrollView>
+                <TouchableOpacity
+                  style={styles.consentModalButton}
+                  onPress={() => {
+                    setShowGoogleConsentModal(false);
+                    promptGoogleLogin();
+                  }}
+                  activeOpacity={0.8}
+                >
+                  <ThemedText
+                    style={styles.consentModalButtonText}
+                    lightColor="#ffffff"
+                    darkColor="#ffffff"
+                  >
+                    了解して連携する
+                  </ThemedText>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.consentModalCancel}
+                  onPress={() => setShowGoogleConsentModal(false)}
+                >
+                  <ThemedText
+                    style={styles.consentModalCancelText}
+                    lightColor="#444444"
+                    darkColor="#444444"
+                  >
+                    キャンセル
+                  </ThemedText>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </Modal>
 
           {errorMessage ? (
             <View style={styles.errorBox}>
@@ -765,7 +1444,7 @@ export default function HomeScreen() {
 
           {imageUri ? (
             <>
-              <View style={[styles.previewContainer, result?.type === 'テスト' && imageWidth && imageHeight && { aspectRatio: imageWidth / imageHeight }]}>
+              <View style={[styles.previewContainer, result?.type === 'テスト' && imageWidth > 0 && imageHeight > 0 && { aspectRatio: imageWidth / imageHeight }]}>
                 <Image source={{ uri: imageUri }} style={styles.previewImage} contentFit="contain" />
                 {result?.type === 'テスト' && (() => {
                   const tr = result as TestResult;
@@ -838,11 +1517,13 @@ export default function HomeScreen() {
                   <View style={styles.analyzeInner}>
                     <ActivityIndicator color="#fff" style={styles.analyzeSpinner} />
                     <ThemedText style={styles.analyzeButtonText}>
-                      AIが解析中...（完了後に広告が出ます）
+                      解析中…広告が流れている間しばらくお待ちください
                     </ThemedText>
                   </View>
                 ) : (
-                  <ThemedText style={styles.analyzeButtonText}>解析する</ThemedText>
+                  <ThemedText style={styles.analyzeButtonText}>
+                    解析する（解析中は広告が流れます）
+                  </ThemedText>
                 )}
               </TouchableOpacity>
               {isPremium ? (
@@ -861,7 +1542,7 @@ export default function HomeScreen() {
                 </TouchableOpacity>
               )}
               <ThemedText style={styles.noticeText}>
-                ※AIが複数枚のプリントを全力で解析するため、数十秒かかります。処理完了後、結果を見る前にスポンサー広告が表示されます🙇‍♀️
+                ※AIが複数枚のプリントを全力で解析するため、数十秒かかります。解析中は広告が表示され、閉じると結果画面へ進みます。
               </ThemedText>
               {analyzeProgress ? (
                 <View style={styles.progressBox}>
@@ -881,11 +1562,17 @@ export default function HomeScreen() {
               <ThemedText type="subtitle" style={styles.resultTitle}>
                 解析結果: {result.type}
               </ThemedText>
+              <ThemedText style={styles.aiNoteText}>
+                ※AIの解析結果は毎回少しずつ変わることがあります。もし結果に違和感がある場合は、お手数ですがもう一度「解析する（解析中は広告が流れます）」をお試しください。
+              </ThemedText>
 
               {result.type === 'お知らせ' ? (
                 <View style={styles.oshiraseBox}>
                   <ThemedText style={styles.resultLabel}>
                     予定一覧（編集可・チェックした予定だけカレンダーに追加されます）
+                  </ThemedText>
+                  <ThemedText style={styles.dateHint}>
+                    タップして日時を修正できます。開始日時・終了日時をタップすると変更できます。
                   </ThemedText>
                   {editedEvents.map((item, index) => (
                     <View key={index} style={styles.eventCard}>
@@ -909,22 +1596,47 @@ export default function HomeScreen() {
                         placeholder="イベント名"
                         placeholderTextColor="#999"
                       />
-                      <ThemedText style={styles.fieldLabel}>開始日時（ISO例: 2025-03-15T10:00:00）</ThemedText>
-                      <TextInput
-                        style={styles.input}
-                        value={item.eventDate}
-                        onChangeText={(t) => updateEditedEvent(index, 'eventDate', t)}
-                        placeholder="2025-03-15T10:00:00"
-                        placeholderTextColor="#999"
-                      />
+                      <ThemedText style={styles.fieldLabel}>開始日時</ThemedText>
+                      <TouchableOpacity
+                        style={styles.datePickerButton}
+                        onPress={() => openDateTimePicker(index, 'eventDate')}
+                        activeOpacity={0.7}
+                      >
+                        <Text style={styles.datePickerButtonText}>
+                          {item.isAllDay && safeParseDate(item.eventDate)
+                            ? `${new Date(item.eventDate).getFullYear()}年${new Date(item.eventDate).getMonth() + 1}月${new Date(item.eventDate).getDate()}日 終日`
+                            : safeParseDate(item.eventDate)
+                            ? `${new Date(item.eventDate).getFullYear()}年${new Date(item.eventDate).getMonth() + 1}月${new Date(item.eventDate).getDate()}日 ${String(new Date(item.eventDate).getHours()).padStart(2, '0')}:${String(new Date(item.eventDate).getMinutes()).padStart(2, '0')}`
+                            : '日時を選択'}
+                        </Text>
+                        <Text style={styles.datePickerIcon}>📅</Text>
+                      </TouchableOpacity>
                       <ThemedText style={styles.fieldLabel}>終了日時</ThemedText>
-                      <TextInput
-                        style={styles.input}
-                        value={item.endDate}
-                        onChangeText={(t) => updateEditedEvent(index, 'endDate', t)}
-                        placeholder="2025-03-15T11:00:00"
-                        placeholderTextColor="#999"
-                      />
+                      <TouchableOpacity
+                        style={[styles.datePickerButton, item.isAllDay && styles.datePickerButtonDisabled]}
+                        onPress={() => !item.isAllDay && openDateTimePicker(index, 'endDate')}
+                        activeOpacity={0.7}
+                        disabled={item.isAllDay}
+                      >
+                        <Text style={styles.datePickerButtonText}>
+                          {item.isAllDay && safeParseDate(item.endDate)
+                            ? '終日（終了は同じ日）'
+                            : safeParseDate(item.endDate)
+                            ? `${new Date(item.endDate).getFullYear()}年${new Date(item.endDate).getMonth() + 1}月${new Date(item.endDate).getDate()}日 ${String(new Date(item.endDate).getHours()).padStart(2, '0')}:${String(new Date(item.endDate).getMinutes()).padStart(2, '0')}`
+                            : '日時を選択'}
+                        </Text>
+                        <Text style={styles.datePickerIcon}>📅</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.allDayRow}
+                        onPress={() => updateEditedEvent(index, 'isAllDay', !item.isAllDay)}
+                        activeOpacity={0.7}
+                      >
+                        <View style={[styles.checkbox, item.isAllDay && styles.checkboxChecked]}>
+                          {item.isAllDay ? <ThemedText style={styles.checkboxMark}>✓</ThemedText> : null}
+                        </View>
+                        <ThemedText style={styles.checkboxLabel}>終日にする</ThemedText>
+                      </TouchableOpacity>
                       <ThemedText style={styles.fieldLabel}>メモ</ThemedText>
                       <TextInput
                         style={[styles.input, styles.inputMultiline]}
@@ -935,8 +1647,258 @@ export default function HomeScreen() {
                         multiline
                         numberOfLines={2}
                       />
+
+                      <TouchableOpacity
+                        style={styles.customToggle}
+                        onPress={() => updateEditedEvent(index, 'useCustomSettings', !item.useCustomSettings)}
+                        activeOpacity={0.7}
+                      >
+                        <Text style={styles.customToggleText}>
+                          {item.useCustomSettings ? '▼ 個別設定を閉じる' : '▶ この予定だけ色・通知を変える'}
+                        </Text>
+                      </TouchableOpacity>
+                      {item.useCustomSettings && (
+                        <View style={styles.customSettingsBox}>
+                          <ThemedText style={styles.fieldLabel}>この予定の色</ThemedText>
+                          <View style={styles.colorRow}>
+                            {GOOGLE_CALENDAR_COLORS.map((c) => (
+                              <TouchableOpacity
+                                key={c.id}
+                                style={[
+                                  styles.colorCircleSm,
+                                  { backgroundColor: c.hex },
+                                  item.customColor === c.hex && styles.colorCircleSelected,
+                                ]}
+                                onPress={() => updateEditedEvent(index, 'customColor', c.hex)}
+                                activeOpacity={0.7}
+                              >
+                                {item.customColor === c.hex && <Text style={styles.colorCheckMarkSm}>✓</Text>}
+                              </TouchableOpacity>
+                            ))}
+                          </View>
+                          <ThemedText style={styles.fieldLabel}>この予定の通知</ThemedText>
+                          {renderReminderRow(
+                            item.customMainReminder,
+                            (v) => updateEditedEvent(index, 'customMainReminder', v)
+                          )}
+                          <ThemedText style={styles.fieldLabel}>予備の通知</ThemedText>
+                          {renderReminderRow(
+                            item.customBackupReminder,
+                            (v) => updateEditedEvent(index, 'customBackupReminder', v)
+                          )}
+                        </View>
+                      )}
                     </View>
                   ))}
+
+                  <ThemedText style={styles.fieldLabel}>登録先</ThemedText>
+                  <TouchableOpacity
+                    style={styles.checkboxRow}
+                    onPress={() => setUseDeviceCalendar((v) => !v)}
+                    activeOpacity={0.8}
+                  >
+                    <View style={[styles.checkbox, useDeviceCalendar && styles.checkboxChecked]}>
+                      {useDeviceCalendar ? <ThemedText style={styles.checkboxMark}>✓</ThemedText> : null}
+                    </View>
+                    <ThemedText
+                      style={styles.checkboxLabel}
+                      lightColor="#333333"
+                      darkColor="#333333"
+                    >
+                      📱 端末の標準カレンダー
+                    </ThemedText>
+                  </TouchableOpacity>
+                  {useDeviceCalendar && Platform.OS === 'ios' && (
+                    <ThemedText
+                      style={styles.colorHint}
+                      lightColor="#4a4a4a"
+                      darkColor="#4a4a4a"
+                    >
+                      ※iPhone標準カレンダーでは個別の色設定は反映されません。
+                    </ThemedText>
+                  )}
+
+                  <ThemedText
+                    style={[styles.fieldLabel, { marginTop: 14 }]}
+                    lightColor={Pastel.coralStrong}
+                    darkColor={Pastel.coralStrong}
+                  >
+                    ☁️ Googleカレンダー（API連携）
+                  </ThemedText>
+                  <ThemedText
+                    style={styles.colorHint}
+                    lightColor="#4a4a4a"
+                    darkColor="#4a4a4a"
+                  >
+                    ※iPhoneの標準カレンダー（または端末内のカレンダー）のみをご利用の方は、このGoogle連携設定は不要です。そのままお使いいただけます。
+                  </ThemedText>
+                  {linkedAccounts.length === 0 ? (
+                    <TouchableOpacity
+                      style={styles.loadAccountsButton}
+                      onPress={() => setShowGoogleConsentModal(true)}
+                      disabled={!googleClientId || loadingGoogleAuth}
+                      activeOpacity={0.8}
+                    >
+                      {loadingGoogleAuth ? (
+                        <ActivityIndicator color="#fff" size="small" />
+                      ) : (
+                        <ThemedText
+                          style={styles.loadAccountsButtonText}
+                          lightColor="#ffffff"
+                          darkColor="#ffffff"
+                        >
+                          Googleで連携する
+                        </ThemedText>
+                      )}
+                    </TouchableOpacity>
+                  ) : (
+                    <>
+                      <View style={styles.accountList}>
+                        {linkedAccounts.map((acc) => {
+                          const checked = selectedLinkedEmails.includes(acc.email);
+                          return (
+                            <View key={acc.email} style={styles.accountRowWithUnlink}>
+                              <TouchableOpacity
+                                style={styles.accountRow}
+                                onPress={() => {
+                                  setSelectedLinkedEmails((prev) =>
+                                    checked ? prev.filter((e) => e !== acc.email) : [...prev, acc.email]
+                                  );
+                                }}
+                                activeOpacity={0.7}
+                              >
+                                <View style={[styles.checkbox, checked && styles.checkboxChecked]}>
+                                  {checked ? <ThemedText style={styles.checkboxMark}>✓</ThemedText> : null}
+                                </View>
+                                <ThemedText
+                                  style={styles.checkboxLabel}
+                                  numberOfLines={1}
+                                  lightColor="#333333"
+                                  darkColor="#333333"
+                                >
+                                  {acc.email}
+                                </ThemedText>
+                              </TouchableOpacity>
+                              <TouchableOpacity
+                                style={styles.unlinkButton}
+                                onPress={() => {
+                                  Alert.alert(
+                                    '連携解除',
+                                    `${acc.email} の連携を解除しますか？`,
+                                    [
+                                      { text: 'キャンセル' },
+                                      {
+                                        text: '解除',
+                                        style: 'destructive',
+                                        onPress: () => {
+                                          removeLinkedAccount(acc.email).then(() =>
+                                            getLinkedAccounts().then(setLinkedAccounts)
+                                          );
+                                          setSelectedLinkedEmails((prev) => prev.filter((e) => e !== acc.email));
+                                        },
+                                      },
+                                    ]
+                                  );
+                                }}
+                              >
+                                <ThemedText
+                                  style={styles.unlinkButtonText}
+                                  lightColor="#c62828"
+                                  darkColor="#c62828"
+                                >
+                                  解除
+                                </ThemedText>
+                              </TouchableOpacity>
+                            </View>
+                          );
+                        })}
+                      </View>
+                      <TouchableOpacity
+                        style={styles.addAccountButton}
+                        onPress={() => {
+                          setOauthIntent('add');
+                          setTimeout(() => promptGoogleLogin(), 100);
+                        }}
+                        disabled={!googleAuthRequest || loadingGoogleAuth}
+                        activeOpacity={0.8}
+                      >
+                        <ThemedText
+                          style={styles.loadAccountsButtonText}
+                          lightColor="#ffffff"
+                          darkColor="#ffffff"
+                        >
+                          ＋ 別のGoogleアカウントを追加連携する
+                        </ThemedText>
+                      </TouchableOpacity>
+                    </>
+                  )}
+
+                  <ThemedText style={styles.fieldLabel}>一括設定（色・通知）</ThemedText>
+                  <TouchableOpacity
+                    style={styles.checkboxRow}
+                    onPress={() => setIsGlobalSettingsEnabled((v) => !v)}
+                    activeOpacity={0.8}
+                  >
+                    <View style={[styles.checkbox, isGlobalSettingsEnabled && styles.checkboxChecked]}>
+                      {isGlobalSettingsEnabled ? <ThemedText style={styles.checkboxMark}>✓</ThemedText> : null}
+                    </View>
+                    <ThemedText style={styles.checkboxLabel}>すべての予定に一括設定を適用する</ThemedText>
+                  </TouchableOpacity>
+                  {!isGlobalSettingsEnabled && (
+                    <ThemedText
+                      style={styles.colorHint}
+                      lightColor="#4a4a4a"
+                      darkColor="#4a4a4a"
+                    >
+                      OFFのときは各予定の「この予定だけ色・通知を変える」の個別設定が使われます。
+                    </ThemedText>
+                  )}
+
+                  <ThemedText style={styles.fieldLabel}>予定の色（カレンダーに反映されます）</ThemedText>
+                  <View style={styles.colorSelectedRow}>
+                    <View style={[styles.colorSelectedCircle, { backgroundColor: calendarColor }]} />
+                    <Text style={styles.colorSelectedName}>
+                      選択中：{GOOGLE_CALENDAR_COLORS.find((c) => c.hex === calendarColor)?.label ?? ''}
+                    </Text>
+                  </View>
+                  <View style={styles.colorRow}>
+                    {GOOGLE_CALENDAR_COLORS.map((c) => (
+                      <TouchableOpacity
+                        key={c.id}
+                        style={[
+                          styles.colorCircle,
+                          { backgroundColor: c.hex },
+                          calendarColor === c.hex && styles.colorCircleSelected,
+                        ]}
+                        onPress={() => setCalendarColor(c.hex)}
+                        activeOpacity={0.7}
+                      >
+                        {calendarColor === c.hex && <Text style={styles.colorCheckMark}>✓</Text>}
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+
+                  {String(Platform.OS) === 'android' && (
+                    <>
+                      <ThemedText
+                        style={styles.colorHint}
+                        lightColor="#4a4a4a"
+                        darkColor="#4a4a4a"
+                      >
+                        ※Googleカレンダー・ウェブへの反映に数分かかることがあります。
+                      </ThemedText>
+                      <TouchableOpacity
+                        style={styles.notifyCheckRow}
+                        onPress={() => setNotifyOnCalendarComplete((v) => !v)}
+                        activeOpacity={0.7}
+                      >
+                        <View style={[styles.checkbox, notifyOnCalendarComplete && styles.checkboxChecked]}>
+                          {notifyOnCalendarComplete ? <ThemedText style={styles.checkboxMark}>✓</ThemedText> : null}
+                        </View>
+                        <ThemedText style={styles.checkboxLabel}>登録完了後に通知で知らせる</ThemedText>
+                      </TouchableOpacity>
+                    </>
+                  )}
 
                   <ThemedText style={styles.fieldLabel}>メイン通知</ThemedText>
                   {renderReminderRow(mainReminder, setMainReminder)}
@@ -1082,7 +2044,9 @@ export default function HomeScreen() {
                     <Text style={styles.explanationBullet}>📅 お知らせプリント</Text>
                     <Text style={styles.explanationBody}>→ カレンダー登録＆通知設定！</Text>
                     <Text style={styles.explanationSub}>
-                      （机の上の写真やスマホのスクショでもOK）
+                      Googleカレンダー（API連携）に対応{'\n'}
+                      Googleカレンダーは12色から色を選んで登録可能{'\n'}
+                      日時の修正もかんたん（プルダウン式ピッカー）
                     </Text>
                   </View>
                   <View style={styles.explanationItem}>
@@ -1130,6 +2094,18 @@ export default function HomeScreen() {
           onComplete={handleRedactionComplete}
         />
       )}
+      <DateTimePickerModal
+        visible={dtPickerVisible}
+        value={(() => {
+          const item = editedEvents[dtPickerTarget.index];
+          if (!item) return new Date();
+          const d = safeParseDate(item[dtPickerTarget.field === 'eventDate' ? 'eventDate' : 'endDate']);
+          return d ?? new Date();
+        })()}
+        onConfirm={handleDateTimePicked}
+        onCancel={() => setDtPickerVisible(false)}
+        title={dtPickerTarget.field === 'eventDate' ? '開始日時を選択' : '終了日時を選択'}
+      />
     </SafeAreaView>
   );
 }
@@ -1366,12 +2342,24 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     color: Pastel.coralStrong,
   },
+  aiNoteText: {
+    fontSize: 11,
+    color: '#777',
+    marginBottom: 8,
+    lineHeight: 16,
+  },
   resultLabel: {
     fontSize: 12,
     opacity: 0.85,
     marginTop: 8,
     marginBottom: 2,
     color: Pastel.coralStrong,
+  },
+  dateHint: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 4,
+    marginBottom: 8,
   },
   oshiraseBox: {
     marginTop: 4,
@@ -1410,6 +2398,29 @@ const styles = StyleSheet.create({
   checkboxLabel: {
     fontSize: 14,
     color: '#333',
+  },
+  checkboxLabelMuted: {
+    fontSize: 14,
+    color: '#999',
+  },
+  checkboxDisabled: {
+    opacity: 0.5,
+  },
+  linkButton: {
+    marginTop: 8,
+    marginBottom: 12,
+    paddingVertical: 8,
+  },
+  linkButtonText: {
+    fontSize: 14,
+    color: Pastel.coralStrong,
+    textDecorationLine: 'underline',
+  },
+  allDayRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 10,
+    marginBottom: 4,
   },
   fieldLabel: {
     fontSize: 12,
@@ -1455,6 +2466,208 @@ const styles = StyleSheet.create({
   reminderButtonTextActive: {
     color: '#fff',
   },
+  calTargetRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 8,
+    marginBottom: 12,
+  },
+  calTargetButton: {
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: Pastel.coralStrong,
+  },
+  calTargetButtonActive: {
+    backgroundColor: Pastel.coralStrong,
+  },
+  calTargetText: {
+    fontSize: 12,
+    color: Pastel.coralStrong,
+    fontWeight: '600',
+  },
+  calTargetTextActive: {
+    color: '#fff',
+  },
+  customToggle: {
+    marginTop: 10,
+    paddingVertical: 8,
+  },
+  customToggleText: {
+    fontSize: 12,
+    color: Pastel.coralStrong,
+    fontWeight: '600',
+  },
+  customSettingsBox: {
+    marginTop: 4,
+    paddingTop: 8,
+    paddingHorizontal: 4,
+    borderTopWidth: 1,
+    borderTopColor: Pastel.coral,
+  },
+  colorCircleSm: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  colorCheckMarkSm: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 'bold',
+    textShadowColor: 'rgba(0,0,0,0.5)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
+  },
+  colorSelectedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 8,
+    marginBottom: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(201,123,99,0.08)',
+    borderRadius: 12,
+  },
+  colorSelectedCircle: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 2,
+    borderColor: '#fff',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
+  },
+  colorSelectedName: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#333',
+  },
+  colorRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginTop: 4,
+    marginBottom: 8,
+  },
+  colorCircle: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  colorCircleSelected: {
+    borderColor: '#333',
+    borderWidth: 3,
+  },
+  colorCheckMark: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+    textShadowColor: 'rgba(0,0,0,0.5)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
+  },
+  colorHint: {
+    fontSize: 11,
+    color: '#888',
+    marginBottom: 12,
+  },
+  datePickerButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderWidth: 1,
+    borderColor: Pastel.coral,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: '#fff',
+  },
+  datePickerButtonText: {
+    fontSize: 15,
+    color: '#333',
+  },
+  datePickerIcon: {
+    fontSize: 18,
+  },
+  datePickerButtonDisabled: {
+    opacity: 0.7,
+  },
+  loadAccountsButton: {
+    backgroundColor: Pastel.coralStrong,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: Pastel.borderRadius,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  loadAccountsButtonText: {
+    color: '#fff',
+    fontSize: 14,
+  },
+  accountList: {
+    marginBottom: 12,
+  },
+  accountRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  linkedAccountBlock: {
+    marginBottom: 14,
+    paddingLeft: 4,
+  },
+  accountRowWithUnlink: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  unlinkButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  unlinkButtonText: {
+    fontSize: 13,
+    color: '#c00',
+    textDecorationLine: 'underline',
+  },
+  addAccountButton: {
+    marginTop: 8,
+    marginBottom: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: Pastel.borderRadius,
+    backgroundColor: Pastel.coral,
+    alignItems: 'center',
+  },
+  loadCalendarsLink: {
+    marginTop: 4,
+    marginBottom: 8,
+    paddingVertical: 6,
+  },
+  calendarSubList: {
+    marginLeft: 20,
+    marginTop: 4,
+  },
+  notifyCheckRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
   shareButton: {
     backgroundColor: Pastel.coralStrong,
     paddingVertical: 12,
@@ -1488,6 +2701,118 @@ const styles = StyleSheet.create({
     opacity: 0.8,
     marginTop: 8,
     color: Pastel.coralStrong,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  pasteModalContent: {
+    backgroundColor: '#fff',
+    borderRadius: Pastel.borderRadius,
+    padding: 20,
+    width: '100%',
+    maxWidth: 400,
+  },
+  consentModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  consentModalContent: {
+    backgroundColor: '#fff',
+    borderRadius: Pastel.borderRadius,
+    padding: 20,
+    width: '100%',
+    maxWidth: 400,
+    maxHeight: '85%',
+  },
+  consentModalTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 12,
+    color: '#333333',
+  },
+  consentModalBody: {
+    fontSize: 14,
+    marginBottom: 14,
+    lineHeight: 22,
+    color: '#333333',
+  },
+  consentModalStep: {
+    fontSize: 13,
+    marginBottom: 10,
+    lineHeight: 20,
+    paddingLeft: 4,
+    color: '#333333',
+  },
+  consentModalButton: {
+    backgroundColor: Pastel.coralStrong,
+    paddingVertical: 12,
+    borderRadius: Pastel.borderRadius,
+    alignItems: 'center',
+    marginTop: 16,
+  },
+  consentModalButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  consentModalCancel: {
+    alignItems: 'center',
+    marginTop: 10,
+    paddingVertical: 8,
+  },
+  consentModalCancelText: {
+    fontSize: 14,
+    color: '#444444',
+  },
+  pasteModalTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 12,
+    color: Pastel.coralStrong,
+  },
+  pasteTextInput: {
+    borderWidth: 1,
+    borderColor: Pastel.coral,
+    borderRadius: 12,
+    padding: 12,
+    fontSize: 15,
+    minHeight: 120,
+    textAlignVertical: 'top',
+  },
+  pasteModalButtons: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 12,
+    marginTop: 16,
+  },
+  pasteModalButtonCancel: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+  },
+  pasteModalButtonCancelText: {
+    fontSize: 15,
+    color: '#666',
+  },
+  pasteModalButtonSubmit: {
+    backgroundColor: Pastel.coralStrong,
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: Pastel.borderRadius,
+  },
+  pasteModalButtonSubmitText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  pasteModalButtonDisabled: {
+    opacity: 0.6,
   },
   testBox: {
     marginTop: 4,

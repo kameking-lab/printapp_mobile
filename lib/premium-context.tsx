@@ -9,7 +9,7 @@ import { Platform } from 'react-native';
 import { isExpoGo } from './env';
 
 const REVENUECAT_API_KEY_IOS = 'appl_oAcevySxzYDoggsbUklkkiqgMln';
-const REVENUECAT_API_KEY_ANDROID = 'YOUR_RC_GOOGLE_KEY';
+const REVENUECAT_API_KEY_ANDROID = 'goog_uFqDhlkdQyDLjCeMrvmyywnyOcG';
 
 interface PremiumContextValue {
   isPremium: boolean;

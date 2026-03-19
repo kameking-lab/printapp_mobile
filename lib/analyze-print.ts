@@ -45,6 +45,16 @@ const SYSTEM_PROMPT = `あなたは学校から配布されるプリントを分
 お知らせの例: {"type":"お知らせ","fullText":"〇〇小学校 保護者会のお知らせ\\n\\n日時 3月15日(金) 10:00～11:00\\n場所 体育館\\n...","events":[{"eventName":"授業参観","eventDate":"2025-03-15T10:00:00","eventEndDate":"2025-03-15T11:00:00","memo":"2年1组"}]}
 テストの例: {"type":"テスト","summaryTitle":"計算テスト","subject":"算数","date":"2025-03-15","problems":[{"text":"1. 3+5を計算しなさい。","correctAnswer":"8","choices":["8","7","9"],"explanation":"3と5を足すと8になります。"},{"text":"2. 次の図の角度を求めなさい。","correctAnswer":"90度","choices":["90度","60度","45度"],"explanation":"直角は90度です。","imageRegion":{"ymin":0.25,"xmin":0.1,"ymax":0.6,"xmax":0.9}}],"redaction_boxes":[{"x_percent":15.5,"y_percent":22.0,"width_percent":12.0,"height_percent":5.0},{"x_percent":15.5,"y_percent":45.0,"width_percent":25.0,"height_percent":8.0}]}`;
 
+const TEXT_INPUT_SYSTEM = `あなたは学校から配布されるプリントのテキストを分析するアシスタントです。
+【重要】ユーザーが貼り付けたテキストをよく読んで、次のどちらかに必ず分類してください。
+・「お知らせ」: 行事案内・保護者会・参観日・配布物の説明・お知らせ文書など、イベントや日程が書かれた内容。
+・「テスト」: 試験問題・ドリル・問題集など、問題番号が付いた問題が複数ある内容。
+
+【お知らせの場合】fullText（貼り付けたテキストの要約またはそのまま）、events: [ { eventName, eventDate（日付が分かればISO 8601例 2025-03-15T10:00:00、日付不明なら空文字""）, eventEndDate?, memo? }, ... ]
+【テストの場合】summaryTitle, subject, date, problems: [ { text, correctAnswer, choices（3〜4個）, explanation? }, ... ]。テキストのみのため imageRegion は省略、redaction_boxes は []。
+
+返答は必ずJSONのみを出力してください。`;
+
 function getApiKey(): string {
   const key = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
   if (!key || key === 'your_api_key_here') {
@@ -58,13 +68,13 @@ function getApiKey(): string {
 function parseEventItem(raw: unknown): OshiraseEventItem {
   const o = raw as Record<string, unknown>;
   const eventName = o?.eventName != null ? String(o.eventName) : '';
-  const eventDate = o?.eventDate != null ? String(o.eventDate) : '';
-  if (!eventName.trim() || !eventDate.trim()) {
-    throw new Error('お知らせの各イベントに eventName と eventDate が必要です。');
+  const eventDate = o?.eventDate != null ? String(o.eventDate).trim() : '';
+  if (!eventName.trim()) {
+    throw new Error('お知らせの各イベントに eventName が必要です。');
   }
   return {
     eventName: eventName.trim(),
-    eventDate: eventDate.trim(),
+    eventDate,
     eventEndDate: o?.eventEndDate != null ? String(o.eventEndDate).trim() : undefined,
     memo: o?.memo != null ? String(o.memo) : undefined,
   };
@@ -175,6 +185,46 @@ export async function analyzePrintImage(imageBase64: string, mimeType: string): 
       return parseAnalyzeResponse(text);
     } catch (parseError) {
       console.warn('[analyze-print] Parse error', parseError);
+      throw new Error('解析結果の形式が不正です。もう一度お試しください。');
+    }
+  } catch (e) {
+    if (e instanceof Error) throw e;
+    throw new Error('解析に失敗しました。');
+  }
+}
+
+/**
+ * 貼り付けたテキストから解析結果を取得する（画像なし）。
+ * お知らせで日付が不明な場合は eventDate が空文字で返る（アプリ側で終日として扱う）。
+ */
+export async function analyzePrintFromText(text: string): Promise<AnalyzeResult> {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new Error('テキストを入力してください。');
+  }
+  try {
+    const apiKey = getApiKey();
+    const ai = new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+      model: MODEL,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: TEXT_INPUT_SYSTEM },
+            { text: `【ユーザーが貼り付けたテキスト】\n\n${trimmed}` },
+          ],
+        },
+      ],
+    });
+    const out = response.text?.trim() ?? '';
+    if (!out) {
+      throw new Error('Gemini API から応答がありませんでした。');
+    }
+    try {
+      return parseAnalyzeResponse(out);
+    } catch (parseError) {
+      console.warn('[analyze-print] Text parse error', parseError);
       throw new Error('解析結果の形式が不正です。もう一度お試しください。');
     }
   } catch (e) {

@@ -6,6 +6,7 @@ import { useCallback, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Linking,
   ScrollView,
   StyleSheet,
   TouchableOpacity,
@@ -18,10 +19,28 @@ import { ThemedView } from '@/components/themed-view';
 import { isExpoGo } from '@/lib/env';
 import { usePremium } from '@/lib/premium-context';
 
+const TERMS_OF_USE_URL = 'https://www.apple.com/legal/internet-services/itunes/dev/stdeula/';
+const PRIVACY_POLICY_URL =
+  process.env.EXPO_PUBLIC_PRIVACY_POLICY_URL ??
+  'https://docs.google.com/document/d/e/2PACX-1vSMcl_jmd_r_B_kL3lh4cmHn0M-zEVYEEDL_36l30hlarBIE4Nybj_a2FxK4vFHGj81a1eTOK61I2IF/pub';
+
 export default function SettingsScreen() {
   const { isPremium, isLoading, refresh } = usePremium();
   const [purchasing, setPurchasing] = useState(false);
   const [restoring, setRestoring] = useState(false);
+
+  const openExternalUrl = useCallback(async (url: string) => {
+    try {
+      const supported = await Linking.canOpenURL(url);
+      if (!supported) {
+        Alert.alert('リンクを開けません', 'URLを開けませんでした。');
+        return;
+      }
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert('リンクを開けません', 'URLを開けませんでした。');
+    }
+  }, []);
 
   const handlePurchase = useCallback(async () => {
     if (isPremium) return;
@@ -132,6 +151,24 @@ export default function SettingsScreen() {
                 <ThemedText style={styles.secondaryButtonText}>購入を復元する</ThemedText>
               )}
             </TouchableOpacity>
+            <View style={styles.legalLinksWrap}>
+              <ThemedText style={styles.legalNote}>購入前にご確認ください:</ThemedText>
+              <View style={styles.legalLinksRow}>
+                <TouchableOpacity
+                  onPress={() => openExternalUrl(TERMS_OF_USE_URL)}
+                  activeOpacity={0.7}
+                >
+                  <ThemedText style={styles.legalLinkText}>利用規約 (Terms of Use)</ThemedText>
+                </TouchableOpacity>
+                <ThemedText style={styles.legalSeparator}> / </ThemedText>
+                <TouchableOpacity
+                  onPress={() => openExternalUrl(PRIVACY_POLICY_URL)}
+                  activeOpacity={0.7}
+                >
+                  <ThemedText style={styles.legalLinkText}>プライバシーポリシー</ThemedText>
+                </TouchableOpacity>
+              </View>
+            </View>
           </View>
         </ScrollView>
       </ThemedView>
@@ -170,4 +207,28 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   secondaryButtonText: { color: '#7cb342', fontSize: 15 },
+  legalLinksWrap: {
+    marginTop: 8,
+    alignItems: 'center',
+  },
+  legalNote: {
+    fontSize: 12,
+    color: '#6b6b6b',
+    marginBottom: 6,
+  },
+  legalLinksRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+  },
+  legalLinkText: {
+    fontSize: 12,
+    color: '#5f6368',
+    textDecorationLine: 'underline',
+  },
+  legalSeparator: {
+    fontSize: 12,
+    color: '#9aa0a6',
+  },
 });

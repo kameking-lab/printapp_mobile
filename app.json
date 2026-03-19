@@ -2,7 +2,10 @@
   "expo": {
     "name": "パシャっと管理",
     "slug": "printapp_mobile",
-    "version": "1.0.0",
+    "version": "1.0.3",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "printappmobile",
@@ -11,10 +14,10 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.kamekinglab.printapp",
-      "buildNumber": "1.0.0",
+      "buildNumber": "3",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSUserTrackingUsageDescription": "広告のパーソナライズと測定のため、許可いただけると助かります。"
+        "NSUserTrackingUsageDescription": "お客様に最適な広告を表示するために使用します。"
       }
     },
     "android": {
@@ -27,10 +30,11 @@
       "permissions": [
         "android.permission.READ_CALENDAR",
         "android.permission.WRITE_CALENDAR",
-        "android.permission.RECORD_AUDIO"
+        "android.permission.RECORD_AUDIO",
+        "com.google.android.gms.permission.AD_ID"
       ],
       "package": "com.kamekinglab.printapp",
-      "versionCode": 1
+      "versionCode": 3
     },
     "web": {
       "output": "static",
@@ -70,7 +74,21 @@
           "iosAppId": "ca-app-pub-8751260838396451~1161114671"
         }
       ],
-      "expo-tracking-transparency"
+      [
+        "expo-tracking-transparency",
+        {
+          "userTrackingPermission": "お客様に最適な広告を表示するために使用します。"
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/icon.png",
+          "color": "#E6F4FE",
+          "sounds": [],
+          "defaultChannel": "calendar"
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
@@ -81,6 +99,9 @@
       "eas": {
         "projectId": "63f3d1fa-a06d-42d2-b641-e6b24f0f9b43"
       }
+    },
+    "updates": {
+      "url": "https://u.expo.dev/63f3d1fa-a06d-42d2-b641-e6b24f0f9b43"
     }
   }
 }

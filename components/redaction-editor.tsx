@@ -600,7 +600,7 @@ export function RedactionEditor({
               onLayout={handleLayout}
             >
               <GestureDetector gesture={composed}>
-                <View style={styles.imageContainer} collapsable={false} pointerEvents="box-none">
+                <View style={styles.imageContainer} collapsable={false}>
                   <Image
                     source={{ uri: imageUri }}
                     style={styles.image}
@@ -661,12 +661,15 @@ export function RedactionEditor({
                 </View>
               </GestureDetector>
               {selectedBox && deleteButtonPosition && selectedIndex !== null && (
-                <View style={styles.deleteButtonLayer} pointerEvents="box-none">
+                <View
+                  style={[
+                    styles.deleteButtonWrap,
+                    { left: deleteButtonPosition.left, top: deleteButtonPosition.top },
+                  ]}
+                  pointerEvents="box-none"
+                >
                   <GestureTouchableOpacity
-                    style={[
-                      styles.deleteButtonFloating,
-                      { left: deleteButtonPosition.left, top: deleteButtonPosition.top },
-                    ]}
+                    style={styles.deleteButtonFloating}
                     onPress={() => handleDelete(selectedIndex)}
                     activeOpacity={0.85}
                   >
@@ -719,14 +722,13 @@ const styles = StyleSheet.create({
     borderColor: '#fff',
   },
   drawPreview: { borderStyle: 'dashed' },
-  deleteButtonLayer: {
-    ...StyleSheet.absoluteFillObject,
+  deleteButtonWrap: {
+    position: 'absolute',
     overflow: 'visible',
     zIndex: 40,
     elevation: 40,
   },
   deleteButtonFloating: {
-    position: 'absolute',
     backgroundColor: Pastel.error,
     paddingHorizontal: 12,
     paddingVertical: 6,
