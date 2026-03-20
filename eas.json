@@ -23,7 +23,7 @@
     "production": {
       "autoIncrement": true,
       "env": {
-        "EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME": "@kenshi.ycc/printapp_mobile"
+        "EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_ANDROID": "937444991341-63p8ouajb29m7jnihkd70makq5he7mkq.apps.googleusercontent.com"
       },
       "channel": "production"
     }

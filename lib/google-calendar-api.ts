@@ -3,8 +3,6 @@
  * 高速モード（ルートB）で使用。OAuth の access_token を渡す。
  */
 
-import Constants from 'expo-constants';
-
 const CALENDAR_LIST_URL = 'https://www.googleapis.com/calendar/v3/users/me/calendarList';
 const CALENDAR_EVENTS_URL = 'https://www.googleapis.com/calendar/v3/calendars';
 
@@ -15,14 +13,13 @@ export interface ApiCalendarItem {
 }
 
 /**
- * Expo AuthSession（ブラウザベース OAuth）用の Google OAuth Client ID。
+ * Expo AuthSession（ネイティブ OAuth）用の Google OAuth Client ID。
  * - iOS: ネイティブ用クライアント ID（EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_IOS）
- * - Android: Google の仕様上、Android タイプのクライアントではカスタム URI スキームが使えないため、
- *   **ウェブアプリケーション** のクライアント ID（EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB）を使用する。
- *   未設定時は本番用 Web クライアント ID にフォールバックする。
+ * - Android: Android 用クライアント ID（EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_ANDROID）を使用する。
+ *   未設定時は本番用 Android クライアント ID にフォールバックする。
  */
-const ANDROID_AUTH_SESSION_WEB_CLIENT_ID_FALLBACK =
-  '937444991341-e2v8oi2n8lor4dk6vg0pd9tdvu61fv50.apps.googleusercontent.com';
+const ANDROID_AUTH_SESSION_CLIENT_ID_FALLBACK =
+  '937444991341-63p8ouajb29m7jnihkd70makq5he7mkq.apps.googleusercontent.com';
 
 export function getGoogleOAuthClientId(platform: 'ios' | 'android'): string {
   if (platform === 'ios') {
@@ -34,47 +31,9 @@ export function getGoogleOAuthClientId(platform: 'ios' | 'android'): string {
     return '';
   }
   return (
-    process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB?.trim() ||
-    ANDROID_AUTH_SESSION_WEB_CLIENT_ID_FALLBACK
+    process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_ANDROID?.trim() ||
+    ANDROID_AUTH_SESSION_CLIENT_ID_FALLBACK
   );
-}
-
-/** Expo AuthSession プロキシのベース（Google ウェブクライアントは https の redirect_uri のみ許可） */
-export const EXPO_GOOGLE_AUTH_PROXY_BASE = 'https://auth.expo.io';
-
-/**
- * Android で Web Client ID を使うとき、Google Cloud はカスタムスキームの redirect を拒否するため、
- * Expo の HTTPS プロキシ URL（従来の makeRedirectUri({ useProxy: true }) と同じ系統）を返す。
- * iOS では undefined（useAuthRequest の既定のネイティブ redirect を使用）。
- *
- * 優先: EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME（例: @yourname/printapp_mobile）
- * 次点: expo-constants の originalFullName（EAS ビルド等で埋まることが多い）
- */
-export function getGoogleAuthSessionProxyRedirectUri(platform: 'ios' | 'android'): string | undefined {
-  if (platform !== 'android') return undefined;
-
-  const envFull = process.env.EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME?.trim();
-  const originalFull =
-    typeof Constants.expoConfig?.originalFullName === 'string'
-      ? (Constants.expoConfig.originalFullName as string).trim()
-      : undefined;
-  const owner = typeof Constants.expoConfig?.owner === 'string' ? Constants.expoConfig.owner.trim() : '';
-  const slug = typeof Constants.expoConfig?.slug === 'string' ? Constants.expoConfig.slug.trim() : '';
-  const fromOwnerSlug = owner && slug ? `@${owner}/${slug}` : undefined;
-
-  const fullName = envFull || originalFull || fromOwnerSlug;
-
-  if (!fullName) {
-    console.error(
-      '[Google OAuth] Android 用 Expo プロキシ URL を組み立てられません（EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME / originalFullName / owner+slug いずれも未取得）。' +
-        ' Google ログインのみ影響します。EAS の project 設定や .env の EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME を確認してください。'
-    );
-    // フェイルセーフ: 環境変数や expoConfig が取得できない場合でも、WEBクライアント要件に合うURLを返す
-    return 'https://auth.expo.io/@kenshi.ycc/printapp_mobile';
-  }
-
-  const normalized = fullName.replace(/^\/+/, '');
-  return `${EXPO_GOOGLE_AUTH_PROXY_BASE}/${normalized}`;
 }
 
 async function apiFetch(

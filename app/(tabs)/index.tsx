@@ -38,7 +38,6 @@ import { initMobileAds, showInterstitialThen, BANNER_UNIT_ID, isExpoGo } from '@
 import { notifyCalendarRegistrationComplete } from '@/lib/calendar-notification';
 import {
   getGoogleOAuthClientId,
-  getGoogleAuthSessionProxyRedirectUri,
   createCalendarEvent,
   type CreateEventPayload,
 } from '@/lib/google-calendar-api';
@@ -371,12 +370,6 @@ export default function HomeScreen() {
     }
   }, []);
 
-  /** Android + Web Client ID: Google は https の redirect_uri のみ → Expo Auth プロキシ URLを使う */
-  const googleOAuthRedirectUri = useMemo(
-    () => getGoogleAuthSessionProxyRedirectUri(Platform.OS as 'ios' | 'android'),
-    []
-  );
-
   const GOOGLE_OAUTH_SCOPES = useMemo(
     () => [
       'openid',
@@ -390,12 +383,12 @@ export default function HomeScreen() {
   const [googleAuthRequest, googleAuthResponse, promptGoogleLogin] = useAuthRequest(
     {
       clientId: googleClientId,
+      androidClientId: process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_ANDROID,
       scopes: GOOGLE_OAUTH_SCOPES,
       extraParams: {
         access_type: 'offline',
         prompt: 'select_account consent',
       },
-      ...(googleOAuthRedirectUri ? { redirectUri: googleOAuthRedirectUri } : {}),
     },
     { scheme: 'printappmobile' }
   );
