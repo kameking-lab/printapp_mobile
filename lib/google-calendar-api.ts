@@ -69,7 +69,8 @@ export function getGoogleAuthSessionProxyRedirectUri(platform: 'ios' | 'android'
       '[Google OAuth] Android 用 Expo プロキシ URL を組み立てられません（EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME / originalFullName / owner+slug いずれも未取得）。' +
         ' Google ログインのみ影響します。EAS の project 設定や .env の EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME を確認してください。'
     );
-    return undefined;
+    // フェイルセーフ: 環境変数や expoConfig が取得できない場合でも、WEBクライアント要件に合うURLを返す
+    return 'https://auth.expo.io/@kenshi.ycc/printapp_mobile';
   }
 
   const normalized = fullName.replace(/^\/+/, '');
