@@ -2,7 +2,7 @@
   "expo": {
     "name": "パシャっと管理",
     "slug": "printapp_mobile",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "runtimeVersion": {
       "policy": "appVersion"
     },
@@ -14,7 +14,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.kamekinglab.printapp",
-      "buildNumber": "3",
+      "buildNumber": "4",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSUserTrackingUsageDescription": "お客様に最適な広告を表示するために使用します。"
@@ -34,7 +34,7 @@
         "com.google.android.gms.permission.AD_ID"
       ],
       "package": "com.kamekinglab.printapp",
-      "versionCode": 3
+      "versionCode": 4
     },
     "web": {
       "output": "static",

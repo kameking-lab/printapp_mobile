@@ -28,9 +28,10 @@ export function getGoogleOAuthClientId(platform: 'ios' | 'android'): string {
   if (platform === 'ios') {
     const id = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_IOS?.trim();
     if (id) return id;
-    throw new Error(
-      'Google OAuth Client ID が未設定です。.env に EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_IOS を設定してください。'
+    console.error(
+      '[Google OAuth] iOS Client ID が未設定です。.env に EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_IOS を設定してください。起動は継続しますが Google ログインは利用できません。'
     );
+    return '';
   }
   return (
     process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB?.trim() ||
@@ -52,18 +53,23 @@ export const EXPO_GOOGLE_AUTH_PROXY_BASE = 'https://auth.expo.io';
 export function getGoogleAuthSessionProxyRedirectUri(platform: 'ios' | 'android'): string | undefined {
   if (platform !== 'android') return undefined;
 
-  const fullName =
-    process.env.EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME?.trim() ||
-    (typeof Constants.expoConfig?.originalFullName === 'string'
-      ? Constants.expoConfig.originalFullName
-      : undefined);
+  const envFull = process.env.EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME?.trim();
+  const originalFull =
+    typeof Constants.expoConfig?.originalFullName === 'string'
+      ? (Constants.expoConfig.originalFullName as string).trim()
+      : undefined;
+  const owner = typeof Constants.expoConfig?.owner === 'string' ? Constants.expoConfig.owner.trim() : '';
+  const slug = typeof Constants.expoConfig?.slug === 'string' ? Constants.expoConfig.slug.trim() : '';
+  const fromOwnerSlug = owner && slug ? `@${owner}/${slug}` : undefined;
+
+  const fullName = envFull || originalFull || fromOwnerSlug;
 
   if (!fullName) {
-    throw new Error(
-      'Android の Google ログイン（Web クライアント）には https のリダイレクト用 URL が必要です。.env に ' +
-        'EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME=@あなたのExpoユーザー名/printapp_mobile を設定するか、' +
-        'Expo アカウントでログインして EAS ビルドするなどし originalFullName が取れる状態にしてください。'
+    console.error(
+      '[Google OAuth] Android 用 Expo プロキシ URL を組み立てられません（EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME / originalFullName / owner+slug いずれも未取得）。' +
+        ' Google ログインのみ影響します。EAS の project 設定や .env の EXPO_PUBLIC_EXPO_PROJECT_FULL_NAME を確認してください。'
     );
+    return undefined;
   }
 
   const normalized = fullName.replace(/^\/+/, '');
