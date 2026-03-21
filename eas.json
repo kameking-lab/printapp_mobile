@@ -23,7 +23,7 @@
     "production": {
       "autoIncrement": true,
       "env": {
-        "EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB": ""
+        "EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB": "937444991341-e2v8oi2n8lor4dk6vg0pd9tdvu61fv50.apps.googleusercontent.com"
       },
       "channel": "production"
     }
