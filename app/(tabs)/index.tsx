@@ -396,12 +396,21 @@ export default function HomeScreen() {
       if (Platform.OS === 'android') {
         await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
       }
-      // 毎回アカウント選択（Account Picker）を出すため、SDK に保持された前回セッションを解除してから signIn
+      // 毎回 Account Picker を出す: キャッシュトークン解除 → signOut で SDK 内の既定アカウントを消してから signIn
+      try {
+        const cached = await GoogleSignin.getTokens();
+        if (cached?.accessToken && Platform.OS === 'android') {
+          await GoogleSignin.clearCachedAccessToken(cached.accessToken);
+        }
+      } catch {
+        /* 未サインインなど */
+      }
       try {
         await GoogleSignin.signOut();
       } catch {
         /* 未サインイン・既にクリア済みでも続行 */
       }
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
       const signInResult = await GoogleSignin.signIn();
       if (signInResult.type !== 'success') {
         return;
