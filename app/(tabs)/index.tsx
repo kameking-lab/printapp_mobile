@@ -4,13 +4,11 @@
  */
 
 import { Image } from 'expo-image';
-import { useAuthRequest } from 'expo-auth-session/providers/google';
 import * as Calendar from 'expo-calendar';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as Print from 'expo-print';
 import * as Share from 'expo-sharing';
-import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -28,6 +26,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { GoogleSignin } from '@react-native-google-signin/google-signin';
 import { useRouter } from 'expo-router';
 
 import { RedactionEditor } from '@/components/redaction-editor';
@@ -36,11 +35,7 @@ import { ThemedView } from '@/components/themed-view';
 import { analyzePrintFromText, analyzePrintImage, reAnalyzeWithPrompt } from '@/lib/analyze-print';
 import { initMobileAds, showInterstitialThen, BANNER_UNIT_ID, isExpoGo } from '@/lib/ads';
 import { notifyCalendarRegistrationComplete } from '@/lib/calendar-notification';
-import {
-  getGoogleOAuthClientId,
-  createCalendarEvent,
-  type CreateEventPayload,
-} from '@/lib/google-calendar-api';
+import { createCalendarEvent, type CreateEventPayload } from '@/lib/google-calendar-api';
 import {
   addOrUpdateLinkedAccount,
   getValidLinkedAccounts,
@@ -351,7 +346,6 @@ export default function HomeScreen() {
   const [loadingGoogleAuth, setLoadingGoogleAuth] = useState(false);
   const [notifyOnCalendarComplete, setNotifyOnCalendarComplete] = useState(false);
   const [showGoogleConsentModal, setShowGoogleConsentModal] = useState(false);
-  const [oauthIntent, setOauthIntent] = useState<'first' | 'add'>( 'first');
   const [showPasteTextModal, setShowPasteTextModal] = useState(false);
   const [pastedText, setPastedText] = useState('');
   const [analyzingText, setAnalyzingText] = useState(false);
@@ -362,85 +356,77 @@ export default function HomeScreen() {
   const router = useRouter();
   const { isPremium } = usePremium();
 
-  const googleClientId = useMemo(() => {
-    try {
-      return getGoogleOAuthClientId(Platform.OS as 'ios' | 'android');
-    } catch {
-      return '';
-    }
-  }, []);
-
-  const GOOGLE_OAUTH_SCOPES = useMemo(
-    () => [
-      'openid',
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/calendar',
-      'https://www.googleapis.com/auth/calendar.events',
-    ],
-    []
-  );
-
-  const [googleAuthRequest, googleAuthResponse, promptGoogleLogin] = useAuthRequest(
-    {
-      clientId: googleClientId,
-      androidClientId: process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_ANDROID,
-      scopes: GOOGLE_OAUTH_SCOPES,
-      extraParams: {
-        access_type: 'offline',
-        prompt: 'select_account consent',
-      },
-    },
-    { scheme: 'printappmobile' }
-  );
-
-  useEffect(() => {
-    WebBrowser.maybeCompleteAuthSession();
+  const googleSignInReady = useMemo(() => {
+    if (Platform.OS === 'web') return false;
+    return Boolean(process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB?.trim());
   }, []);
 
   useEffect(() => {
-    if (
-      !googleAuthResponse ||
-      googleAuthResponse.type !== 'success' ||
-      !googleAuthResponse.authentication?.accessToken
-    ) {
+    if (Platform.OS === 'web') return;
+    const webClientId = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB?.trim();
+    if (!webClientId) {
+      console.error(
+        '[Google Sign-In] EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB が未設定です。EAS の環境変数を確認してください。'
+      );
       return;
     }
-    const auth = googleAuthResponse.authentication;
-    const token = auth.accessToken;
-    setOauthIntent('first');
+    const iosClientId = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_IOS?.trim();
+    GoogleSignin.configure({
+      webClientId,
+      scopes: [
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/calendar',
+      ],
+      ...(Platform.OS === 'ios' && iosClientId ? { iosClientId } : {}),
+    });
+  }, []);
+
+  const runGoogleLinkFlow = useCallback(async () => {
+    if (Platform.OS === 'web') {
+      Alert.alert('未対応', 'この環境では Google カレンダー連携は利用できません。');
+      return;
+    }
+    const webClientId = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB?.trim();
+    if (!webClientId) {
+      Alert.alert('設定エラー', 'Google Web Client ID が未設定です。ビルド設定を確認してください。');
+      return;
+    }
     setLoadingGoogleAuth(true);
-    fetchGoogleUserEmail(token)
-      .then((email) => {
-        const config = auth.getRequestConfig();
-        return addOrUpdateLinkedAccount({
-          email,
-          accessToken: config.accessToken,
-          refreshToken: config.refreshToken,
-          expiresIn: config.expiresIn,
-          issuedAt: config.issuedAt,
-        }).then(() => email);
-      })
-      .then((email) =>
-        getLinkedAccounts().then((all) => {
-          setLinkedAccounts(all);
-          setSelectedLinkedEmails((prev) =>
-            prev.includes(email) ? prev : [...prev, email]
-          );
-        })
-      )
-      .catch((e) => {
-        console.warn('[Calendar] OAuth follow-up failed', e);
-        Alert.alert(
-          'エラー',
-          e instanceof Error ? e.message : '連携の処理に失敗しました。'
-        );
-      })
-      .finally(() => setLoadingGoogleAuth(false));
-  }, [googleAuthResponse, googleClientId]);
+    try {
+      if (Platform.OS === 'android') {
+        await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+      }
+      const signInResult = await GoogleSignin.signIn();
+      if (signInResult.type !== 'success') {
+        return;
+      }
+      const tokens = await GoogleSignin.getTokens();
+      const accessToken = tokens.accessToken;
+      const email = await fetchGoogleUserEmail(accessToken);
+      const issuedAt = Math.floor(Date.now() / 1000);
+      await addOrUpdateLinkedAccount({
+        email,
+        accessToken,
+        issuedAt,
+        expiresIn: 3600,
+      });
+      const all = await getLinkedAccounts();
+      setLinkedAccounts(all);
+      setSelectedLinkedEmails((prev) => (prev.includes(email) ? prev : [...prev, email]));
+    } catch (e) {
+      console.warn('[Calendar] Google Sign-In failed', e);
+      Alert.alert(
+        'エラー',
+        e instanceof Error ? e.message : '連携の処理に失敗しました。'
+      );
+    } finally {
+      setLoadingGoogleAuth(false);
+    }
+  }, []);
 
   const hasRestoredLinkedAccountsRef = useRef(false);
   useEffect(() => {
-    if (!googleClientId || hasRestoredLinkedAccountsRef.current) return;
+    if (hasRestoredLinkedAccountsRef.current) return;
     hasRestoredLinkedAccountsRef.current = true;
     getLinkedAccounts()
       .then((all) => {
@@ -449,7 +435,7 @@ export default function HomeScreen() {
         setSelectedLinkedEmails(all.map((a) => a.email));
       })
       .catch(() => {});
-  }, [googleClientId]);
+  }, []);
 
   useEffect(() => {
     console.log('[Ads] initMobileAds called. isPremium=', isPremium);
@@ -884,7 +870,7 @@ export default function HomeScreen() {
     if (selectedLinkedEmails.length > 0) {
       let selectedValid: ValidLinkedAccount[];
       try {
-        const valid = await getValidLinkedAccounts(googleClientId, GOOGLE_OAUTH_SCOPES);
+        const valid = await getValidLinkedAccounts();
         selectedValid = valid.filter((a) => selectedLinkedEmails.includes(a.email));
       } catch {
         Alert.alert('エラー', 'アカウント情報の取得に失敗しました。');
@@ -963,7 +949,7 @@ export default function HomeScreen() {
       notifyCalendarRegistrationComplete(selectedItems.length).catch(() => {});
     }
     cleanupCalendarStateAfterRegistration();
-  }, [editedEvents, result, calendarColor, mainReminder, backupReminder, isGlobalSettingsEnabled, useDeviceCalendar, linkedAccounts, selectedLinkedEmails, googleClientId, GOOGLE_OAUTH_SCOPES, notifyOnCalendarComplete, cleanupCalendarStateAfterRegistration, getDeviceCalendarId]);
+  }, [editedEvents, result, calendarColor, mainReminder, backupReminder, isGlobalSettingsEnabled, useDeviceCalendar, linkedAccounts, selectedLinkedEmails, notifyOnCalendarComplete, cleanupCalendarStateAfterRegistration, getDeviceCalendarId]);
 
   const saveAsFlashcards = useCallback(async () => {
     const selected = selectableProblems.filter((p) => p.selected);
@@ -1401,7 +1387,7 @@ export default function HomeScreen() {
                   style={styles.consentModalButton}
                   onPress={() => {
                     setShowGoogleConsentModal(false);
-                    promptGoogleLogin();
+                    runGoogleLinkFlow();
                   }}
                   activeOpacity={0.8}
                 >
@@ -1729,7 +1715,7 @@ export default function HomeScreen() {
                     <TouchableOpacity
                       style={styles.loadAccountsButton}
                       onPress={() => setShowGoogleConsentModal(true)}
-                      disabled={!googleClientId || loadingGoogleAuth}
+                      disabled={!googleSignInReady || loadingGoogleAuth}
                       activeOpacity={0.8}
                     >
                       {loadingGoogleAuth ? (
@@ -1809,10 +1795,9 @@ export default function HomeScreen() {
                       <TouchableOpacity
                         style={styles.addAccountButton}
                         onPress={() => {
-                          setOauthIntent('add');
-                          setTimeout(() => promptGoogleLogin(), 100);
+                          setTimeout(() => runGoogleLinkFlow(), 100);
                         }}
-                        disabled={!googleAuthRequest || loadingGoogleAuth}
+                        disabled={!googleSignInReady || loadingGoogleAuth}
                         activeOpacity={0.8}
                       >
                         <ThemedText

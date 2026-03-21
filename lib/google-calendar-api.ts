@@ -12,30 +12,6 @@ export interface ApiCalendarItem {
   accessRole?: string;
 }
 
-/**
- * Expo AuthSession（ネイティブ OAuth）用の Google OAuth Client ID。
- * - iOS: ネイティブ用クライアント ID（EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_IOS）
- * - Android: Android 用クライアント ID（EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_ANDROID）を使用する。
- *   未設定時は本番用 Android クライアント ID にフォールバックする。
- */
-const ANDROID_AUTH_SESSION_CLIENT_ID_FALLBACK =
-  '937444991341-63p8ouajb29m7jnihkd70makq5he7mkq.apps.googleusercontent.com';
-
-export function getGoogleOAuthClientId(platform: 'ios' | 'android'): string {
-  if (platform === 'ios') {
-    const id = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_IOS?.trim();
-    if (id) return id;
-    console.error(
-      '[Google OAuth] iOS Client ID が未設定です。.env に EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_IOS を設定してください。起動は継続しますが Google ログインは利用できません。'
-    );
-    return '';
-  }
-  return (
-    process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_ANDROID?.trim() ||
-    ANDROID_AUTH_SESSION_CLIENT_ID_FALLBACK
-  );
-}
-
 async function apiFetch(
   url: string,
   accessToken: string,

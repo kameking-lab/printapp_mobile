@@ -1,11 +1,11 @@
 /**
  * Google OAuth 複数アカウントの端末内永続化（キー: メールアドレス）
- * 各アカウントごとに accessToken / refreshToken を保持し、期限切れ時はリフレッシュする。
+ * 各アカウントごとに accessToken を保持。期限切れは @react-native-google-signin の
+ * 現在セッションと照合し、一致すれば getTokens() で更新する。
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { TokenResponse, refreshAsync } from 'expo-auth-session';
-import { discovery } from 'expo-auth-session/providers/google';
+import { GoogleSignin } from '@react-native-google-signin/google-signin';
 
 const STORAGE_KEY = '@printapp/google_oauth_accounts';
 
@@ -56,54 +56,59 @@ export type ValidLinkedAccount = { email: string; accessToken: string };
 
 /**
  * 有効なアクセストークンを持つ連携済みアカウント一覧を返す。
- * 期限切れはリフレッシュして保存。リフレッシュ失敗時もストレージからは削除せず残す（リストは縮めない）。
+ * 保存トークンが期限内ならそのまま。切れている場合は GoogleSignin の現在ユーザーと
+ * メールが一致するときのみ getTokens() で更新して保存する。
  */
-export async function getValidLinkedAccounts(
-  clientId: string,
-  scopes: string[]
-): Promise<ValidLinkedAccount[]> {
+export async function getValidLinkedAccounts(): Promise<ValidLinkedAccount[]> {
   const list = await getLinkedAccounts();
+  const now = Math.floor(Date.now() / 1000);
   const result: ValidLinkedAccount[] = [];
-  const updated: StoredAccount[] = [];
+  const updated = list.map((a) => ({ ...a }));
+  let needsSave = false;
 
-  for (const acc of list) {
-    const tokenInfo = {
-      accessToken: acc.accessToken,
-      refreshToken: acc.refreshToken,
-      expiresIn: acc.expiresIn,
-      issuedAt: acc.issuedAt ?? Math.floor(Date.now() / 1000),
-    };
-    const isFresh = TokenResponse.isTokenFresh(tokenInfo);
-    if (isFresh) {
+  let sdkEmail: string | null = null;
+  let sdkAccessToken: string | null = null;
+  try {
+    const current = GoogleSignin.getCurrentUser();
+    const email = current?.user.email?.trim().toLowerCase();
+    if (email) {
+      const tokens = await GoogleSignin.getTokens();
+      sdkEmail = email;
+      sdkAccessToken = tokens.accessToken;
+    }
+  } catch {
+    // 未サインインなど
+  }
+
+  for (let i = 0; i < updated.length; i++) {
+    const acc = updated[i];
+    const emailKey = acc.email.trim().toLowerCase();
+
+    const tokenFresh =
+      acc.expiresIn != null &&
+      acc.issuedAt != null &&
+      acc.issuedAt + acc.expiresIn - 180 > now;
+
+    if (tokenFresh) {
       result.push({ email: acc.email, accessToken: acc.accessToken });
-      updated.push(acc);
       continue;
     }
-    if (!acc.refreshToken) {
-      updated.push(acc);
-      continue;
-    }
-    try {
-      const refreshed = await refreshAsync(
-        { clientId, refreshToken: acc.refreshToken, scopes },
-        discovery
-      );
-      const config = refreshed.getRequestConfig();
+
+    if (sdkEmail === emailKey && sdkAccessToken) {
       const newAcc: StoredAccount = {
         email: acc.email,
-        accessToken: config.accessToken,
-        refreshToken: config.refreshToken ?? acc.refreshToken,
-        expiresIn: config.expiresIn,
-        issuedAt: config.issuedAt,
+        accessToken: sdkAccessToken,
+        issuedAt: now,
+        expiresIn: 3600,
+        refreshToken: undefined,
       };
-      result.push({ email: acc.email, accessToken: newAcc.accessToken });
-      updated.push(newAcc);
-    } catch {
-      updated.push(acc);
+      updated[i] = newAcc;
+      needsSave = true;
+      result.push({ email: acc.email, accessToken: sdkAccessToken });
     }
   }
 
-  if (updated.some((u, i) => u.accessToken !== list[i]?.accessToken)) {
+  if (needsSave) {
     await saveLinkedAccounts(updated);
   }
   return result;
