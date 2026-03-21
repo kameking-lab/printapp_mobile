@@ -396,6 +396,12 @@ export default function HomeScreen() {
       if (Platform.OS === 'android') {
         await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
       }
+      // 毎回アカウント選択（Account Picker）を出すため、SDK に保持された前回セッションを解除してから signIn
+      try {
+        await GoogleSignin.signOut();
+      } catch {
+        /* 未サインイン・既にクリア済みでも続行 */
+      }
       const signInResult = await GoogleSignin.signIn();
       if (signInResult.type !== 'success') {
         return;

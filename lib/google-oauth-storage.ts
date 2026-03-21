@@ -36,7 +36,7 @@ export async function getLinkedAccounts(): Promise<StoredAccount[]> {
 
 /**
  * 1アカウントを追加（配列に push）、または同一 email が既にいればその要素だけ更新。
- * email を一意キーとして配列を管理する。
+ * email を一意キーとして配列を管理する（単一上書きではなく複数アカウントを保持）。
  */
 export async function addOrUpdateLinkedAccount(account: StoredAccount): Promise<void> {
   const list = await getLinkedAccounts();
