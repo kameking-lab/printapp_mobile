@@ -26,7 +26,11 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { GoogleSignin } from '@react-native-google-signin/google-signin';
+import {
+  GoogleSignin,
+  isErrorWithCode,
+  statusCodes,
+} from '@react-native-google-signin/google-signin';
 import { useRouter } from 'expo-router';
 
 import { RedactionEditor } from '@/components/redaction-editor';
@@ -178,6 +182,22 @@ const REMINDER_OPTIONS: { label: string; value: 'none' | number }[] = [
 ];
 
 const FULLTEXT_HEADER = '\n\n【プリント原文】\n';
+
+/**
+ * Google Sign-In まわりの通知。Android では Modal 終了直後やネイティブ UI 復帰時に
+ * Activity が不安定になり得るため、公式トラブルシュートで推奨される
+ * InteractionManager 経由で表示する。
+ */
+function presentGoogleSignInAlert(title: string, message: string) {
+  const show = () => Alert.alert(title, message);
+  if (Platform.OS === 'android') {
+    InteractionManager.runAfterInteractions(() => {
+      requestAnimationFrame(show);
+    });
+  } else {
+    show();
+  }
+}
 
 /* ================================================================
  *  DateTimePickerModal — 年・月・日・時・分を ▲▼ ボタンで選択
@@ -353,6 +373,8 @@ export default function HomeScreen() {
   const [dtPickerTarget, setDtPickerTarget] = useState<{ index: number; field: 'eventDate' | 'endDate' }>({ index: 0, field: 'eventDate' });
   const flattenCaptureRef = useRef<View>(null);
   const bannerRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 連打で IN_PROGRESS になるのを防ぐ（setState より先に同期で立てる） */
+  const googleAuthInFlightRef = useRef(false);
   const router = useRouter();
   const { isPremium } = usePremium();
 
@@ -383,26 +405,95 @@ export default function HomeScreen() {
 
   const runGoogleLinkFlow = useCallback(async () => {
     if (Platform.OS === 'web') {
-      Alert.alert('未対応', 'この環境では Google カレンダー連携は利用できません。');
+      presentGoogleSignInAlert('未対応', 'この環境では Google カレンダー連携は利用できません。');
       return;
     }
     const webClientId = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID_WEB?.trim();
     if (!webClientId) {
-      Alert.alert('設定エラー', 'Google Web Client ID が未設定です。ビルド設定を確認してください。');
+      presentGoogleSignInAlert(
+        '設定エラー',
+        'Google Web Client ID が未設定です。ビルド設定を確認してください。'
+      );
       return;
     }
+    if (googleAuthInFlightRef.current) {
+      presentGoogleSignInAlert(
+        'Google 連携',
+        `コード: ${statusCodes.IN_PROGRESS}\n別のサインイン処理が進行中です。完了してから再度お試しください。`
+      );
+      return;
+    }
+
+    googleAuthInFlightRef.current = true;
     setLoadingGoogleAuth(true);
+
+    const showError = (code: string, message: string) => {
+      presentGoogleSignInAlert('Google 連携エラー', `コード: ${code}\n${message}`);
+    };
+
     try {
+      if (Platform.OS === 'android') {
+        await new Promise<void>((resolve) => {
+          InteractionManager.runAfterInteractions(() => resolve());
+        });
+      }
+
       if (Platform.OS === 'android') {
         await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
       }
+
+      if (GoogleSignin.hasPreviousSignIn()) {
+        try {
+          await GoogleSignin.signOut();
+        } catch (signOutErr: unknown) {
+          if (isErrorWithCode(signOutErr)) {
+            showError(signOutErr.code, signOutErr.message);
+          } else {
+            showError(
+              'SIGN_OUT_FAILED',
+              signOutErr instanceof Error ? signOutErr.message : String(signOutErr)
+            );
+          }
+          return;
+        }
+      }
+
       const signInResult = await GoogleSignin.signIn();
-      if (signInResult.type !== 'success') {
+      if (signInResult.type === 'cancelled') {
+        presentGoogleSignInAlert(
+          'Google 連携',
+          `コード: ${statusCodes.SIGN_IN_CANCELLED}\nサインインがキャンセルされました。`
+        );
         return;
       }
-      const tokens = await GoogleSignin.getTokens();
-      const accessToken = tokens.accessToken;
-      const email = await fetchGoogleUserEmail(accessToken);
+
+      let accessToken: string;
+      try {
+        const tokens = await GoogleSignin.getTokens();
+        accessToken = tokens.accessToken;
+      } catch (tokenErr: unknown) {
+        if (isErrorWithCode(tokenErr)) {
+          showError(tokenErr.code, tokenErr.message);
+        } else {
+          showError(
+            'GET_TOKENS_FAILED',
+            tokenErr instanceof Error ? tokenErr.message : String(tokenErr)
+          );
+        }
+        return;
+      }
+
+      let email: string;
+      try {
+        email = await fetchGoogleUserEmail(accessToken);
+      } catch (userInfoErr: unknown) {
+        showError(
+          'USERINFO_FAILED',
+          userInfoErr instanceof Error ? userInfoErr.message : String(userInfoErr)
+        );
+        return;
+      }
+
       const issuedAt = Math.floor(Date.now() / 1000);
       await addOrUpdateLinkedAccount({
         email,
@@ -413,13 +504,15 @@ export default function HomeScreen() {
       const all = await getLinkedAccounts();
       setLinkedAccounts(all);
       setSelectedLinkedEmails((prev) => (prev.includes(email) ? prev : [...prev, email]));
-    } catch (e) {
+    } catch (e: unknown) {
       console.warn('[Calendar] Google Sign-In failed', e);
-      Alert.alert(
-        'エラー',
-        e instanceof Error ? e.message : '連携の処理に失敗しました。'
-      );
+      if (isErrorWithCode(e)) {
+        showError(e.code, e.message);
+      } else {
+        showError('UNKNOWN', e instanceof Error ? e.message : String(e));
+      }
     } finally {
+      googleAuthInFlightRef.current = false;
       setLoadingGoogleAuth(false);
     }
   }, []);
@@ -1795,7 +1888,7 @@ export default function HomeScreen() {
                       <TouchableOpacity
                         style={styles.addAccountButton}
                         onPress={() => {
-                          setTimeout(() => runGoogleLinkFlow(), 100);
+                          runGoogleLinkFlow();
                         }}
                         disabled={!googleSignInReady || loadingGoogleAuth}
                         activeOpacity={0.8}
